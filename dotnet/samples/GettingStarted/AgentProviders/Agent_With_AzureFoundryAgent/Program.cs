@@ -2,6 +2,7 @@
 
 // This sample shows how to create and use a simple AI agent with Azure Foundry Agents as the backend.
 
+using Azure;
 using Azure.AI.Agents.Persistent;
 using Azure.Identity;
 using Microsoft.Agents.AI;
