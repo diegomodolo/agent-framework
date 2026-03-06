@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 from pytest import MonkeyPatch, mark, param
-
 from samples.getting_started.agents.azure_ai.azure_ai_basic import (
     main as azure_ai_basic,
 )

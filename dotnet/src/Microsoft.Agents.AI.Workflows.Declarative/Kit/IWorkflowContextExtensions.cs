@@ -7,8 +7,8 @@ using System.Threading.Tasks;
 using Microsoft.Agents.AI.Workflows.Declarative.Extensions;
 using Microsoft.Agents.AI.Workflows.Declarative.Interpreter;
 using Microsoft.Agents.AI.Workflows.Declarative.PowerFx;
-using Microsoft.Bot.ObjectModel;
-using Microsoft.Bot.ObjectModel.Abstractions;
+using Microsoft.Agents.ObjectModel;
+using Microsoft.Agents.ObjectModel.Abstractions;
 
 namespace Microsoft.Agents.AI.Workflows.Declarative.Kit;
 
@@ -53,7 +53,7 @@ public static class IWorkflowContextExtensions
     /// </example>
     public static async ValueTask<string> FormatTemplateAsync(this IWorkflowContext context, IEnumerable<string> lines, CancellationToken cancellationToken = default)
     {
-        WorkflowFormulaState state = await context.GetStateAsync(cancellationToken: default).ConfigureAwait(false);
+        WorkflowFormulaState state = await context.GetStateAsync(cancellationToken).ConfigureAwait(false);
 
         StringBuilder builder = new();
         foreach (string line in lines)

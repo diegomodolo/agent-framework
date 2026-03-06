@@ -1,31 +1,33 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import contextlib
+import copy
 import functools
 import inspect
 import logging
+import types
+import typing
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, overload
 
 from ..observability import create_processing_span
 from ._events import (
-    ExecutorCompletedEvent,
-    ExecutorFailedEvent,
-    ExecutorInvokedEvent,
     WorkflowErrorDetails,
+    WorkflowEvent,
     _framework_event_origin,  # type: ignore[reportPrivateUsage]
 )
 from ._model_utils import DictConvertible
-from ._runner_context import Message, RunnerContext  # type: ignore
-from ._shared_state import SharedState
-from ._typing_utils import is_instance_of
-from ._workflow_context import WorkflowContext, validate_function_signature
+from ._request_info_mixin import RequestInfoMixin
+from ._runner_context import MessageType, RunnerContext, WorkflowMessage
+from ._state import State
+from ._typing_utils import is_instance_of, normalize_type_to_list, resolve_type_annotation
+from ._workflow_context import WorkflowContext, validate_workflow_context_annotation
 
 logger = logging.getLogger(__name__)
 
 
 # region Executor
-class Executor(DictConvertible):
+class Executor(RequestInfoMixin, DictConvertible):
     """Base class for all workflow executors that process messages and perform computations.
 
     ## Overview
@@ -89,16 +91,16 @@ class Executor(DictConvertible):
 
         class ParentExecutor(Executor):
             @handler
-            async def handle_domain_request(
+            async def handle_subworkflow_request(
                 self,
-                request: DomainRequest,  # Subclass of RequestInfoMessage
-                ctx: WorkflowContext[RequestResponse[RequestInfoMessage, Any] | DomainRequest],
+                request: SubWorkflowRequestMessage,
+                ctx: WorkflowContext[SubWorkflowResponseMessage],
             ) -> None:
                 if self.is_allowed(request.domain):
-                    response = RequestResponse(data=True, original_request=request, request_id=request.request_id)
-                    await ctx.send_message(response, target_id=request.source_executor_id)
+                    response = request.create_response(data=True)
+                    await ctx.send_message(response, target_id=request.executor_id)
                 else:
-                    await ctx.send_message(request)  # Forward to external
+                    await ctx.request_info(request.source_event, response_type=request.source_event.response_type)
 
     ## Context Types
     Handler methods receive different WorkflowContext variants based on their type annotations:
@@ -113,8 +115,8 @@ class Executor(DictConvertible):
             async def log_message(self, msg: str, ctx: WorkflowContext) -> None:
                 print(f"Received: {msg}")  # Only logging, no outputs
 
-    ### WorkflowContext[T_Out]
-    Enables sending messages of type T_Out via `ctx.send_message()`:
+    ### WorkflowContext[OutT]
+    Enables sending messages of type OutT via `ctx.send_message()`:
 
     .. code-block:: python
 
@@ -123,8 +125,8 @@ class Executor(DictConvertible):
             async def handler(self, msg: str, ctx: WorkflowContext[int]) -> None:
                 await ctx.send_message(42)  # Can send int messages
 
-    ### WorkflowContext[T_Out, T_W_Out]
-    Enables both sending messages (T_Out) and yielding workflow outputs (T_W_Out):
+    ### WorkflowContext[OutT, W_OutT]
+    Enables both sending messages (OutT) and yielding workflow outputs (W_OutT):
 
     .. code-block:: python
 
@@ -153,6 +155,11 @@ class Executor(DictConvertible):
     Executors can contain sub-workflows using WorkflowExecutor. Sub-workflows can make requests
     that parent workflows can intercept. See WorkflowExecutor documentation for details on
     workflow composition patterns and request/response handling.
+
+    ## State Management
+    Executors can contain states that persist across workflow runs and checkpoints. Override the
+    `on_checkpoint_save` and `on_checkpoint_restore` methods to implement custom state
+    serialization and restoration logic.
 
     ## Implementation Notes
     - Do not call `execute()` directly - it's invoked by the workflow engine
@@ -193,7 +200,9 @@ class Executor(DictConvertible):
 
         from builtins import type as builtin_type
 
-        self._handlers: dict[builtin_type[Any], Callable[[Any, WorkflowContext[Any, Any]], Awaitable[None]]] = {}
+        self._handlers: dict[
+            builtin_type[Any] | types.UnionType, Callable[[Any, WorkflowContext[Any, Any]], Awaitable[None]]
+        ] = {}
         self._handler_specs: list[dict[str, Any]] = []
         if not defer_discovery:
             self._discover_handlers()
@@ -204,11 +213,14 @@ class Executor(DictConvertible):
                     "Please define at least one handler using the @handler decorator."
                 )
 
+            # Initialize RequestInfoMixin to discover response handlers
+            self._discover_response_handlers()
+
     async def execute(
         self,
         message: Any,
         source_executor_ids: list[str],
-        shared_state: SharedState,
+        state: State,
         runner_context: RunnerContext,
         trace_contexts: list[dict[str, str]] | None = None,
         source_span_ids: list[str] | None = None,
@@ -221,7 +233,7 @@ class Executor(DictConvertible):
         Args:
             message: The message to be processed by the executor.
             source_executor_ids: The IDs of the source executors that sent messages to this executor.
-            shared_state: The shared state for the workflow.
+            state: The state for the workflow.
             runner_context: The runner context that provides methods to send messages and events.
             trace_contexts: Optional trace contexts from multiple sources for OpenTelemetry propagation.
             source_span_ids: Optional source span IDs from multiple sources for linking.
@@ -230,90 +242,88 @@ class Executor(DictConvertible):
             An awaitable that resolves to the result of the execution.
         """
         # Create processing span for tracing (gracefully handles disabled tracing)
-
-        # Handle case where Message wrapper is passed instead of raw data
-        if isinstance(message, Message):
-            message = message.data
-
         with create_processing_span(
             self.id,
             self.__class__.__name__,
+            str(MessageType.STANDARD if not isinstance(message, WorkflowMessage) else message.type),
             type(message).__name__,
             source_trace_contexts=trace_contexts,
             source_span_ids=source_span_ids,
         ):
             # Find the handler and handler spec that matches the message type.
-            handler: Callable[[Any, WorkflowContext[Any, Any]], Awaitable[None]] | None = None
-            ctx_annotation = None
-            for message_type in self._handlers:
-                if is_instance_of(message, message_type):
-                    handler = self._handlers[message_type]
-                    # Find the corresponding handler spec for context annotation
-                    for spec in self._handler_specs:
-                        if spec.get("message_type") == message_type:
-                            ctx_annotation = spec.get("ctx_annotation")
-                            break
-                    break
+            handler = self._find_handler(message)
 
-            if handler is None:
-                raise RuntimeError(f"Executor {self.__class__.__name__} cannot handle message of type {type(message)}.")
+            original_message = message
+            if isinstance(message, WorkflowMessage):
+                # Unwrap raw data for handler call
+                message = message.data
 
             # Create the appropriate WorkflowContext based on handler specs
             context = self._create_context_for_handler(
                 source_executor_ids=source_executor_ids,
-                shared_state=shared_state,
+                state=state,
                 runner_context=runner_context,
-                ctx_annotation=ctx_annotation,
                 trace_contexts=trace_contexts,
                 source_span_ids=source_span_ids,
+                request_id=original_message.original_request_info_event.request_id
+                if isinstance(original_message, WorkflowMessage) and original_message.original_request_info_event
+                else None,
             )
 
             # Invoke the handler with the message and context
+            # Use deepcopy to capture original input state before handler can mutate it
             with _framework_event_origin():
-                invoke_event = ExecutorInvokedEvent(self.id)
+                invoke_event = WorkflowEvent.executor_invoked(self.id, copy.deepcopy(message))
             await context.add_event(invoke_event)
             try:
                 await handler(message, context)
             except Exception as exc:
                 # Surface structured executor failure before propagating
                 with _framework_event_origin():
-                    failure_event = ExecutorFailedEvent(self.id, WorkflowErrorDetails.from_exception(exc))
+                    failure_event = WorkflowEvent.executor_failed(self.id, WorkflowErrorDetails.from_exception(exc))
                 await context.add_event(failure_event)
                 raise
             with _framework_event_origin():
-                completed_event = ExecutorCompletedEvent(self.id)
+                # Include sent messages and yielded outputs as the completion data
+                sent_messages = context.get_sent_messages()
+                yielded_outputs = context.get_yielded_outputs()
+                completion_data = sent_messages + yielded_outputs
+                completed_event = WorkflowEvent.executor_completed(
+                    self.id, completion_data if completion_data else None
+                )
             await context.add_event(completed_event)
 
     def _create_context_for_handler(
         self,
         source_executor_ids: list[str],
-        shared_state: SharedState,
+        state: State,
         runner_context: RunnerContext,
-        ctx_annotation: Any,
         trace_contexts: list[dict[str, str]] | None = None,
         source_span_ids: list[str] | None = None,
+        request_id: str | None = None,
     ) -> WorkflowContext[Any]:
         """Create the appropriate WorkflowContext based on the handler's context annotation.
 
         Args:
             source_executor_ids: The IDs of the source executors that sent messages to this executor.
-            shared_state: The shared state for the workflow.
+            state: The state for the workflow.
             runner_context: The runner context that provides methods to send messages and events.
-            ctx_annotation: The context annotation from the handler spec to determine which context type to create.
             trace_contexts: Optional trace contexts from multiple sources for OpenTelemetry propagation.
             source_span_ids: Optional source span IDs from multiple sources for linking.
+            request_id: Optional request ID if this context is for a `handle_response` handler.
 
         Returns:
             WorkflowContext[Any] based on the handler's context annotation.
         """
         # Create WorkflowContext
         return WorkflowContext(
-            executor_id=self.id,
+            executor=self,
             source_executor_ids=source_executor_ids,
-            shared_state=shared_state,
+            state=state,
             runner_context=runner_context,
             trace_contexts=trace_contexts,
             source_span_ids=source_span_ids,
+            request_id=request_id,
         )
 
     def _discover_handlers(self) -> None:
@@ -322,35 +332,27 @@ class Executor(DictConvertible):
         for attr_name in dir(self.__class__):
             try:
                 attr = getattr(self.__class__, attr_name)
-                # Discover @handler methods
-                if callable(attr) and hasattr(attr, "_handler_spec"):
-                    handler_spec = attr._handler_spec  # type: ignore
-                    message_type = handler_spec["message_type"]
-
-                    # Keep full generic types for handler registration to avoid conflicts
-                    # Different RequestResponse[T, U] specializations are distinct handler types
-
-                    if self._handlers.get(message_type) is not None:
-                        raise ValueError(f"Duplicate handler for type {message_type} in {self.__class__.__name__}")
-
-                    # Get the bound method
-                    bound_method = getattr(self, attr_name)
-                    self._handlers[message_type] = bound_method
-
-                    # Add to unified handler specs list
-                    self._handler_specs.append({
-                        "name": handler_spec["name"],
-                        "message_type": message_type,
-                        "output_types": handler_spec.get("output_types", []),
-                        "workflow_output_types": handler_spec.get("workflow_output_types", []),
-                        "ctx_annotation": handler_spec.get("ctx_annotation"),
-                        "source": "class_method",  # Distinguish from instance handlers if needed
-                    })
             except AttributeError:
-                # Skip attributes that may not be accessible
+                # Skip attributes that may not be accessible (e.g., dynamic descriptors)
                 continue
 
-    def can_handle(self, message: Any) -> bool:
+            # Discover @handler methods
+            if callable(attr) and hasattr(attr, "_handler_spec"):
+                handler_spec = attr._handler_spec  # type: ignore
+                message_type = handler_spec["message_type"]
+
+                # Keep full generic types for handler registration to avoid conflicts
+                if self._handlers.get(message_type) is not None:
+                    raise ValueError(f"Duplicate handler for type {message_type} in {self.__class__.__name__}")
+
+                # Get the bound method
+                bound_method = getattr(self, attr_name)
+                self._handlers[message_type] = bound_method
+
+                # Add to unified handler specs list
+                self._handler_specs.append({**handler_spec})
+
+    def can_handle(self, message: WorkflowMessage) -> bool:
         """Check if the executor can handle a given message type.
 
         Args:
@@ -359,16 +361,29 @@ class Executor(DictConvertible):
         Returns:
             True if the executor can handle the message type, False otherwise.
         """
-        return any(is_instance_of(message, message_type) for message_type in self._handlers)
+        if message.type == MessageType.RESPONSE:
+            if message.original_request_info_event is None:
+                logger.warning(
+                    f"Executor {self.__class__.__name__} received a response message without an original request event."
+                )
+                return False
+
+            return any(
+                is_instance_of(message.original_request_info_event.data, message_type[0])
+                and is_instance_of(message.data, message_type[1])
+                for message_type in self._response_handlers
+            )
+
+        return any(is_instance_of(message.data, message_type) for message_type in self._handlers)
 
     def _register_instance_handler(
         self,
         name: str,
         func: Callable[[Any, WorkflowContext[Any]], Awaitable[Any]],
-        message_type: type,
+        message_type: type | types.UnionType,
         ctx_annotation: Any,
-        output_types: list[type],
-        workflow_output_types: list[type],
+        output_types: list[type[Any] | types.UnionType],
+        workflow_output_types: list[type[Any] | types.UnionType],
     ) -> None:
         """Register a handler at instance level.
 
@@ -390,11 +405,10 @@ class Executor(DictConvertible):
             "ctx_annotation": ctx_annotation,
             "output_types": output_types,
             "workflow_output_types": workflow_output_types,
-            "source": "instance_method",  # Distinguish from class handlers if needed
         })
 
     @property
-    def input_types(self) -> list[type[Any]]:
+    def input_types(self) -> list[type[Any] | types.UnionType]:
         """Get the list of input types that this executor can handle.
 
         Returns:
@@ -403,32 +417,32 @@ class Executor(DictConvertible):
         return list(self._handlers.keys())
 
     @property
-    def output_types(self) -> list[type[Any]]:
+    def output_types(self) -> list[type[Any] | types.UnionType]:
         """Get the list of output types that this executor can produce via send_message().
 
         Returns:
             A list of the output types inferred from the handlers' WorkflowContext[T] annotations.
         """
-        output_types: set[type[Any]] = set()
+        output_types: set[type[Any] | types.UnionType] = set()
 
         # Collect output types from all handlers
-        for handler_spec in self._handler_specs:
+        for handler_spec in self._handler_specs + self._response_handler_specs:
             handler_output_types = handler_spec.get("output_types", [])
             output_types.update(handler_output_types)
 
         return list(output_types)
 
     @property
-    def workflow_output_types(self) -> list[type[Any]]:
+    def workflow_output_types(self) -> list[type[Any] | types.UnionType]:
         """Get the list of workflow output types that this executor can produce via yield_output().
 
         Returns:
             A list of the workflow output types inferred from handlers' WorkflowContext[T, U] annotations.
         """
-        output_types: set[type[Any]] = set()
+        output_types: set[type[Any] | types.UnionType] = set()
 
         # Collect workflow output types from all handlers
-        for handler_spec in self._handler_specs:
+        for handler_spec in self._handler_specs + self._response_handler_specs:
             handler_workflow_output_types = handler_spec.get("workflow_output_types", [])
             output_types.update(handler_workflow_output_types)
 
@@ -437,6 +451,70 @@ class Executor(DictConvertible):
     def to_dict(self) -> dict[str, Any]:
         """Serialize executor definition for workflow topology export."""
         return {"id": self.id, "type": self.type}
+
+    def _find_handler(self, message: Any) -> Callable[[Any, WorkflowContext[Any, Any]], Awaitable[None]]:
+        """Find the handler for a given message.
+
+        Args:
+            message: The message to find the handler for.
+
+        Returns:
+            The handler function if found, None otherwise
+        """
+        if isinstance(message, WorkflowMessage):
+            # Case where Message wrapper is passed instead of raw data
+            # Handler can be a standard handler or a response handler
+            if message.type == MessageType.STANDARD:
+                for message_type in self._handlers:
+                    if is_instance_of(message.data, message_type):
+                        return self._handlers[message_type]
+                raise RuntimeError(
+                    f"Executor {self.__class__.__name__} cannot handle message of type {type(message.data)}."
+                )
+            # Response message case - find response handler based on original request and response types
+            if message.original_request_info_event is None:
+                raise RuntimeError(
+                    f"Executor {self.__class__.__name__} received a response message without an original request event."
+                )
+            handler = self._find_response_handler(message.original_request_info_event.data, message.data)
+            if not handler:
+                raise RuntimeError(
+                    f"Executor {self.__class__.__name__} cannot handle request of type "
+                    f"{type(message.original_request_info_event.data)} and response of type {type(message.data)}."
+                )
+            return handler
+
+        # Standard raw message data case - only standard handlers apply
+        for message_type in self._handlers:
+            if is_instance_of(message, message_type):
+                return self._handlers[message_type]
+        raise RuntimeError(f"Executor {self.__class__.__name__} cannot handle message of type {type(message)}.")
+
+    async def on_checkpoint_save(self) -> dict[str, Any]:
+        """Hook called when the workflow is being saved to a checkpoint.
+
+        Override this method in subclasses to implement custom logic that should
+        return state to be saved in the checkpoint.
+
+        The returned state dictionary will be passed to `on_checkpoint_restore`
+        when the workflow is restored from the checkpoint. The dictionary should
+        only contain JSON-serializable data.
+
+        Returns:
+            A state dictionary to be saved during checkpointing.
+        """
+        return {}
+
+    async def on_checkpoint_restore(self, state: dict[str, Any]) -> None:
+        """Hook called when the workflow is restored from a checkpoint.
+
+        Override this method in subclasses to implement custom logic that should
+        run when the workflow is restored from a checkpoint.
+
+        Args:
+            state: The state dictionary that was saved during checkpointing.
+        """
+        ...
 
 
 # endregion: Executor
@@ -448,8 +526,30 @@ ExecutorT = TypeVar("ExecutorT", bound="Executor")
 ContextT = TypeVar("ContextT", bound="WorkflowContext[Any, Any]")
 
 
+@overload
 def handler(
     func: Callable[[ExecutorT, Any, ContextT], Awaitable[Any]],
+) -> Callable[[ExecutorT, Any, ContextT], Awaitable[Any]]: ...
+
+
+@overload
+def handler(
+    *,
+    input: type | types.UnionType | str | None = None,
+    output: type | types.UnionType | str | None = None,
+    workflow_output: type | types.UnionType | str | None = None,
+) -> Callable[
+    [Callable[..., Awaitable[Any]]],
+    Callable[..., Awaitable[Any]],
+]: ...
+
+
+def handler(
+    func: Callable[[ExecutorT, Any, ContextT], Awaitable[Any]] | None = None,
+    *,
+    input: type | types.UnionType | str | None = None,
+    output: type | types.UnionType | str | None = None,
+    workflow_output: type | types.UnionType | str | None = None,
 ) -> (
     Callable[[ExecutorT, Any, ContextT], Awaitable[Any]]
     | Callable[
@@ -459,29 +559,101 @@ def handler(
 ):
     """Decorator to register a handler for an executor.
 
+    Type information can be provided in two mutually exclusive ways:
+
+    1. **Introspection** (default): Types are inferred from function signature annotations.
+       Use type annotations on the message parameter and WorkflowContext generic parameters.
+
+    2. **Explicit parameters**: Types are specified via decorator parameters (input, output,
+       workflow_output). When ANY explicit parameter is provided, ALL types must come from
+       explicit parameters - introspection is completely disabled. The ``input`` parameter
+       is required; ``output`` and ``workflow_output`` are optional (default to no outputs).
+
     Args:
-        func: The function to decorate. Can be None when used without parameters.
+        func: The function to decorate. Can be None when used with parameters.
+        input: Explicit input type(s) for this handler. Required when using explicit mode.
+            Supports union types (e.g., ``str | int``) and string forward references.
+        output: Explicit output type(s) that can be sent via ``ctx.send_message()``.
+            Optional; defaults to no outputs if not specified.
+        workflow_output: Explicit output type(s) that can be yielded via ``ctx.yield_output()``.
+            Optional; defaults to no outputs if not specified.
 
     Returns:
         The decorated function with handler metadata.
 
     Example:
-        @handler
-        async def handle_string(self, message: str, ctx: WorkflowContext[str]) -> None:
-            ...
+        .. code-block:: python
 
-        @handler
-        async def handle_data(self, message: dict, ctx: WorkflowContext[str | int]) -> None:
-            ...
+            # Mode 1: Introspection - types from annotations
+            @handler
+            async def handle_string(self, message: str, ctx: WorkflowContext[str]) -> None: ...
+
+
+            # Mode 2: Explicit types - ALL types from decorator params
+            # Note: No type annotations on function parameters when using explicit types
+            @handler(input=str | int, output=bool)
+            async def handle_data(self, message, ctx): ...
+
+
+            # Explicit with string forward references
+            @handler(input="MyCustomType | int", output="ResponseType")
+            async def handle_custom(self, message, ctx): ...
+
+
+            # Explicit with all three type parameters
+            @handler(input=str, output=int, workflow_output=bool)
+            async def handle_full(self, message, ctx):
+                await ctx.send_message(42)  # int - matches output
+                await ctx.yield_output(True)  # bool - matches workflow_output
     """
 
     def decorator(
         func: Callable[[ExecutorT, Any, ContextT], Awaitable[Any]],
     ) -> Callable[[ExecutorT, Any, ContextT], Awaitable[Any]]:
-        # Extract the message type and validate using unified validation
-        message_type, ctx_annotation, inferred_output_types, inferred_workflow_output_types = (
-            validate_function_signature(func, "Handler method")
-        )
+        # Check if ANY explicit type parameter was provided - if so, use ONLY explicit params.
+        # This is "all or nothing" - no mixing of explicit params with introspection.
+        use_explicit_types = input is not None or output is not None or workflow_output is not None
+
+        if use_explicit_types:
+            # Resolve string forward references using the function's globals
+            resolved_input_type = resolve_type_annotation(input, func.__globals__) if input is not None else None
+            resolved_output_type = resolve_type_annotation(output, func.__globals__) if output is not None else None
+            resolved_workflow_output_type = (
+                resolve_type_annotation(workflow_output, func.__globals__) if workflow_output is not None else None
+            )
+
+            # Validate signature structure (correct number of params, ctx is WorkflowContext)
+            # but skip type extraction since we're using explicit types
+            _validate_handler_signature(func, skip_message_annotation=True)
+
+            # Use explicit types only - missing params default to empty
+            message_type = resolved_input_type
+            if message_type is None:
+                raise ValueError(f"Handler {func.__name__} with explicit type parameters must specify 'input' type")
+
+            final_output_types = normalize_type_to_list(resolved_output_type) if resolved_output_type else []
+            final_workflow_output_types = (
+                normalize_type_to_list(resolved_workflow_output_type) if resolved_workflow_output_type else []
+            )
+            # Get ctx_annotation for consistency (even though types come from explicit params)
+            ctx_annotation = (
+                inspect.signature(func).parameters[list(inspect.signature(func).parameters.keys())[2]].annotation
+            )
+        else:
+            # Use introspection for ALL types - no explicit params provided
+            introspected_message_type, ctx_annotation, inferred_output_types, inferred_workflow_output_types = (
+                _validate_handler_signature(func, skip_message_annotation=False)
+            )
+
+            message_type = introspected_message_type
+            if message_type is None:
+                raise ValueError(
+                    f"Handler {func.__name__} requires either a message parameter type annotation "
+                    "or explicit type parameters (input, output, workflow_output)"
+                )
+
+            final_output_types = inferred_output_types
+            final_workflow_output_types = inferred_workflow_output_types
 
         # Get signature for preservation
         sig = inspect.signature(func)
@@ -499,14 +671,84 @@ def handler(
             "name": func.__name__,
             "message_type": message_type,
             # Keep output_types and workflow_output_types in spec for validators
-            "output_types": inferred_output_types,
-            "workflow_output_types": inferred_workflow_output_types,
+            "output_types": final_output_types,
+            "workflow_output_types": final_workflow_output_types,
             "ctx_annotation": ctx_annotation,
         }
 
         return wrapper
 
-    return decorator(func)
+    # Handle both @handler and @handler(...) usage patterns
+    if func is not None:
+        # Called as @handler without parentheses
+        return decorator(func)
+    # Called as @handler(...) with parentheses
+    return decorator
 
 
 # endregion: Handler Decorator
+
+# region Handler Validation
+
+
+def _validate_handler_signature(
+    func: Callable[..., Any],
+    *,
+    skip_message_annotation: bool = False,
+) -> tuple[type | None, Any, list[type[Any] | types.UnionType], list[type[Any] | types.UnionType]]:
+    """Validate function signature for executor functions.
+
+    Args:
+        func: The function to validate
+        skip_message_annotation: If True, skip validation that message parameter has a type
+            annotation. Used when input_type is explicitly provided to the @handler decorator.
+
+    Returns:
+        Tuple of (message_type, ctx_annotation, output_types, workflow_output_types).
+        message_type may be None if skip_message_annotation is True and no annotation exists.
+
+    Raises:
+        ValueError: If the function signature is invalid
+    """
+    signature = inspect.signature(func)
+    params = list(signature.parameters.values())
+
+    expected_counts = 3  # self, message, ctx
+    param_description = "(self, message: T, ctx: WorkflowContext[U, V])"
+    if len(params) != expected_counts:
+        raise ValueError(f"Handler {func.__name__} must have {param_description}. Got {len(params)} parameters.")
+
+    # Check message parameter has type annotation (unless skipped)
+    message_param = params[1]
+    if not skip_message_annotation and message_param.annotation == inspect.Parameter.empty:
+        raise ValueError(f"Handler {func.__name__} must have a type annotation for the message parameter")
+
+    # Resolve string annotations from `from __future__ import annotations`.
+    # Fall back to raw annotations if resolution fails (e.g. unresolvable forward refs,
+    # AttributeError, or RecursionError), so registration failures are easier to diagnose.
+    try:
+        type_hints = typing.get_type_hints(func)
+    except Exception:
+        type_hints = {p.name: p.annotation for p in params}
+
+    # Validate ctx parameter is WorkflowContext and extract type args
+    ctx_param = params[2]
+    ctx_annotation = type_hints.get(ctx_param.name, ctx_param.annotation)
+    if skip_message_annotation and ctx_annotation == inspect.Parameter.empty:
+        # When explicit types are provided via @handler(input=..., output=...),
+        # the ctx parameter doesn't need a type annotation - types come from the decorator.
+        output_types: list[type[Any] | types.UnionType] = []
+        workflow_output_types: list[type[Any] | types.UnionType] = []
+    else:
+        output_types, workflow_output_types = validate_workflow_context_annotation(
+            ctx_annotation, f"parameter '{ctx_param.name}'", "Handler"
+        )
+
+    message_type = type_hints.get(message_param.name, message_param.annotation)
+    if message_type == inspect.Parameter.empty:
+        message_type = None
+
+    return message_type, ctx_annotation, output_types, workflow_output_types
+
+
+# endregion: Handler Validation

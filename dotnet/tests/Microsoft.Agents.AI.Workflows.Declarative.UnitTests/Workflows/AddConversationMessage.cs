@@ -52,7 +52,7 @@ public static class WorkflowProvider
     /// <summary>
     /// Adds a new message to the specified agent conversation
     /// </summary>
-    internal sealed class AddMessageExecutor(FormulaSession session, WorkflowAgentProvider agentProvider) : ActionExecutor(id: "add_message", session)
+    internal sealed class AddMessageExecutor(FormulaSession session, ResponseAgentProvider agentProvider) : ActionExecutor(id: "add_message", session)
     {
         // <inheritdoc />
         protected override async ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken)
@@ -114,6 +114,6 @@ public static class WorkflowProvider
         builder.AddEdge(workflowTest, addMessage);
 
         // Build the workflow
-        return builder.Build();
+        return builder.Build(validateOrphans: false);
     }
 }

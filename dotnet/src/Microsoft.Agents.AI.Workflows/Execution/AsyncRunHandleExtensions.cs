@@ -1,6 +1,5 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
-using System;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -8,12 +7,6 @@ namespace Microsoft.Agents.AI.Workflows.Execution;
 
 internal static class AsyncRunHandleExtensions
 {
-    public async static ValueTask<Checkpointed<TRunType>> WithCheckpointingAsync<TRunType>(this AsyncRunHandle runHandle, Func<ValueTask<TRunType>> prepareFunc)
-    {
-        TRunType run = await prepareFunc().ConfigureAwait(false);
-        return new Checkpointed<TRunType>(run, runHandle);
-    }
-
     public static async ValueTask<StreamingRun> EnqueueAndStreamAsync<TInput>(this AsyncRunHandle runHandle, TInput input, CancellationToken cancellationToken = default)
     {
         await runHandle.EnqueueMessageAsync(input, cancellationToken).ConfigureAwait(false);

@@ -8,10 +8,8 @@ We've provided a set of [Sample Workflows](../../../workflow-samples/) within th
 
 Please refer to the [README](../../../workflow-samples/README.md) for setup instructions to run the sample workflows in your environment.
 
-As part of our [Getting Started with Declarative Workflows](../../samples/GettingStarted/Workflows/Declarative/README.md),
+As part of our [Getting Started with Declarative Workflows](../../samples/03-workflows/Declarative/README.md),
 we've provided a console application that is able to execute any declarative workflow.
-
-Please refer to the [README](../../samples/GettingStarted/Workflows/Declarative/README.md) for configuration instructions.
 
 ## Actions
 
@@ -55,7 +53,7 @@ Please refer to the [README](../../samples/GettingStarted/Workflows/Declarative/
 |**ConditionItem**|Represents a single conditional statement within a group. It evaluates a specific logical condition and determines the next step in the flow.
 |**ContinueLoop**|Skips the remaining steps in the current iteration and continues with the next loop cycle. Commonly used to bypass specific cases without exiting the loop entirely.
 |**EndConversation**|Terminates the current conversation session. It ensures any necessary cleanup or final actions are performed before closing.
-|**EndDialog**|Ends the current dialog or sub-dialog within a broader conversation flow. This helps modularize complex interactions.
+|**EndWorkflow**|Ends the current workflow or sub-workflow within a broader conversation flow. This helps modularize complex interactions.
 |**Foreach**|Iterates through a collection of items, executing a set of actions for each. Ideal for processing lists or batch operations.
 |**GotoAction**|Jumps directly to a specified action within the workflow. Enables non-linear navigation in the logic flow.
 

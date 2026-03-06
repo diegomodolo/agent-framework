@@ -2,7 +2,7 @@
 
 using System;
 using System.Collections.Generic;
-using System.Text.Json;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
@@ -11,32 +11,101 @@ using Microsoft.Shared.Diagnostics;
 namespace Microsoft.Agents.AI;
 
 /// <summary>
-/// Provides an abstract base class for components that enhance AI context management during agent invocations.
+/// Provides an abstract base class for components that enhance AI context during agent invocations.
 /// </summary>
 /// <remarks>
 /// <para>
 /// An AI context provider is a component that participates in the agent invocation lifecycle by:
 /// <list type="bullet">
 /// <item><description>Listening to changes in conversations</description></item>
-/// <item><description>Providing additional context to AI models or agents before invocation</description></item>
+/// <item><description>Providing additional context to agents during invocation</description></item>
 /// <item><description>Supplying additional function tools for enhanced capabilities</description></item>
 /// <item><description>Processing invocation results for state management or learning</description></item>
 /// </list>
 /// </para>
 /// <para>
-/// Context providers operate through a two-phase lifecycle: they are called before invocation via
-/// <see cref="InvokingAsync"/> to provide context, and optionally called after invocation via
+/// Context providers operate through a two-phase lifecycle: they are called at the start of invocation via
+/// <see cref="InvokingAsync"/> to provide context, and optionally called at the end of invocation via
 /// <see cref="InvokedAsync"/> to process results.
 /// </para>
 /// </remarks>
 public abstract class AIContextProvider
 {
+    private static IEnumerable<ChatMessage> DefaultExternalOnlyFilter(IEnumerable<ChatMessage> messages)
+        => messages.Where(m => m.GetAgentRequestMessageSourceType() == AgentRequestMessageSourceType.External);
+    private static IEnumerable<ChatMessage> DefaultNoopFilter(IEnumerable<ChatMessage> messages)
+        => messages;
+
+    private IReadOnlyList<string>? _stateKeys;
+
     /// <summary>
-    /// Called immediately before an AI model or agent is invoked to provide additional context.
+    /// Initializes a new instance of the <see cref="AIContextProvider"/> class.
     /// </summary>
-    /// <param name="context">Contains the request context including the messages that will be sent to the AI model or agent.</param>
+    /// <param name="provideInputMessageFilter">An optional filter function to apply to input messages before providing context via <see cref="ProvideAIContextAsync"/>. If not set, defaults to including only <see cref="AgentRequestMessageSourceType.External"/> messages.</param>
+    /// <param name="storeInputRequestMessageFilter">An optional filter function to apply to request messages before storing context via <see cref="StoreAIContextAsync"/>. If not set, defaults to including only <see cref="AgentRequestMessageSourceType.External"/> messages.</param>
+    /// <param name="storeInputResponseMessageFilter">An optional filter function to apply to response messages before storing context via <see cref="StoreAIContextAsync"/>. If not set, defaults to a no-op filter that includes all response messages.</param>
+    protected AIContextProvider(
+        Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>>? provideInputMessageFilter = null,
+        Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>>? storeInputRequestMessageFilter = null,
+        Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>>? storeInputResponseMessageFilter = null)
+    {
+        this.ProvideInputMessageFilter = provideInputMessageFilter ?? DefaultExternalOnlyFilter;
+        this.StoreInputRequestMessageFilter = storeInputRequestMessageFilter ?? DefaultExternalOnlyFilter;
+        this.StoreInputResponseMessageFilter = storeInputResponseMessageFilter ?? DefaultNoopFilter;
+    }
+
+    /// <summary>
+    /// Gets the filter function to apply to input messages before providing context via <see cref="ProvideAIContextAsync"/>.
+    /// </summary>
+    protected Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>> ProvideInputMessageFilter { get; }
+
+    /// <summary>
+    /// Gets the filter function to apply to request messages before storing context via <see cref="StoreAIContextAsync"/>.
+    /// </summary>
+    protected Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>> StoreInputRequestMessageFilter { get; }
+
+    /// <summary>
+    /// Gets the filter function to apply to response messages before storing context via <see cref="StoreAIContextAsync"/>.
+    /// </summary>
+    protected Func<IEnumerable<ChatMessage>, IEnumerable<ChatMessage>> StoreInputResponseMessageFilter { get; }
+
+    /// <summary>
+    /// Gets the set of keys used to store the provider state in the <see cref="AgentSession.StateBag"/>.
+    /// </summary>
+    /// <remarks>
+    /// The default value is a single-element set containing the name of the concrete type (e.g. <c>"TextSearchProvider"</c>).
+    /// Implementations may override this to provide custom keys, for example when multiple
+    /// instances of the same provider type are used in the same session, or when a provider
+    /// stores state under more than one key.
+    /// </remarks>
+    public virtual IReadOnlyList<string> StateKeys => this._stateKeys ??= [this.GetType().Name];
+
+    /// <summary>
+    /// Called at the start of agent invocation to provide additional context.
+    /// </summary>
+    /// <param name="context">Contains the request context including the caller provided messages that will be used by the agent for this invocation.</param>
     /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
-    /// <returns>A task that represents the asynchronous operation. The task result contains the <see cref="AIContext"/> with additional context to be provided to the AI model or agent.</returns>
+    /// <returns>A task that represents the asynchronous operation. The task result contains the <see cref="AIContext"/> with additional context to be used by the agent during this invocation.</returns>
+    /// <remarks>
+    /// <para>
+    /// Implementers can load any additional context required at this time, such as:
+    /// <list type="bullet">
+    /// <item><description>Retrieving relevant information from knowledge bases</description></item>
+    /// <item><description>Adding system instructions or prompts</description></item>
+    /// <item><description>Providing function tools for the current invocation</description></item>
+    /// <item><description>Injecting contextual messages from conversation history</description></item>
+    /// </list>
+    /// </para>
+    /// </remarks>
+    public ValueTask<AIContext> InvokingAsync(InvokingContext context, CancellationToken cancellationToken = default)
+        => this.InvokingCoreAsync(Throw.IfNull(context), cancellationToken);
+
+    /// <summary>
+    /// Called at the start of agent invocation to provide additional context.
+    /// </summary>
+    /// <param name="context">Contains the request context including the caller provided messages that will be used by the agent for this invocation.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>A task that represents the asynchronous operation. The task result contains the <see cref="AIContext"/> with additional context to be used by the agent during this invocation.</returns>
     /// <remarks>
     /// <para>
     /// Implementers can load any additional context required at this time, such as:
@@ -48,13 +117,127 @@ public abstract class AIContextProvider
     /// </list>
     /// </para>
     /// <para>
-    /// The returned context will be combined with context from other providers before being passed to the AI model or agent.
+    /// The default implementation of this method filters the input messages using the configured provide-input message filter
+    /// (which defaults to including only <see cref="AgentRequestMessageSourceType.External"/> messages),
+    /// then calls <see cref="ProvideAIContextAsync"/> to get additional context,
+    /// stamps any messages from the returned context with <see cref="AgentRequestMessageSourceType.AIContextProvider"/> source attribution,
+    /// and merges the returned context with the original (unfiltered) input context (concatenating instructions, messages, and tools).
+    /// For most scenarios, overriding <see cref="ProvideAIContextAsync"/> is sufficient to provide additional context,
+    /// while still benefiting from the default filtering, merging and source stamping behavior.
+    /// However, for scenarios that require more control over context filtering, merging or source stamping, overriding this method
+    /// allows you to directly control the full <see cref="AIContext"/> returned for the invocation.
     /// </para>
     /// </remarks>
-    public abstract ValueTask<AIContext> InvokingAsync(InvokingContext context, CancellationToken cancellationToken = default);
+    protected virtual async ValueTask<AIContext> InvokingCoreAsync(InvokingContext context, CancellationToken cancellationToken = default)
+    {
+        var inputContext = context.AIContext;
+
+        // Create a filtered context for ProvideAIContextAsync, filtering input messages
+        // to exclude non-external messages (e.g. chat history, other AI context provider messages).
+        var filteredContext = new InvokingContext(
+            context.Agent,
+            context.Session,
+            new AIContext
+            {
+                Instructions = inputContext.Instructions,
+                Messages = inputContext.Messages is not null ? this.ProvideInputMessageFilter(inputContext.Messages) : null,
+                Tools = inputContext.Tools
+            });
+
+        var provided = await this.ProvideAIContextAsync(filteredContext, cancellationToken).ConfigureAwait(false);
+
+        var mergedInstructions = (inputContext.Instructions, provided.Instructions) switch
+        {
+            (null, null) => null,
+            (string a, null) => a,
+            (null, string b) => b,
+            (string a, string b) => a + "\n" + b
+        };
+
+        var providedMessages = provided.Messages is not null
+            ? provided.Messages.Select(m => m.WithAgentRequestMessageSource(AgentRequestMessageSourceType.AIContextProvider, this.GetType().FullName!))
+            : null;
+
+        var mergedMessages = (inputContext.Messages, providedMessages) switch
+        {
+            (null, null) => null,
+            (var a, null) => a,
+            (null, var b) => b,
+            (var a, var b) => a.Concat(b)
+        };
+
+        var mergedTools = (inputContext.Tools, provided.Tools) switch
+        {
+            (null, null) => null,
+            (var a, null) => a,
+            (null, var b) => b,
+            (var a, var b) => a.Concat(b)
+        };
+
+        return new AIContext
+        {
+            Instructions = mergedInstructions,
+            Messages = mergedMessages,
+            Tools = mergedTools
+        };
+    }
 
     /// <summary>
-    /// Called immediately after an AI model or agent has been invoked to process the results.
+    /// When overridden in a derived class, provides additional AI context to be merged with the input context for the current invocation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This method is called from <see cref="InvokingCoreAsync"/>.
+    /// Note that <see cref="InvokingCoreAsync"/> can be overridden to directly control context merging and source stamping, in which case
+    /// it is up to the implementer to call this method as needed to retrieve the additional context.
+    /// </para>
+    /// <para>
+    /// In contrast with <see cref="InvokingCoreAsync"/>, this method only returns additional context to be merged with the input,
+    /// while <see cref="InvokingCoreAsync"/> is responsible for returning the full merged <see cref="AIContext"/> for the invocation.
+    /// </para>
+    /// </remarks>
+    /// <param name="context">Contains the request context including the caller provided messages that will be used by the agent for this invocation.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>
+    /// A task that represents the asynchronous operation. The task result contains an <see cref="AIContext"/>
+    /// with additional context to be merged with the input context.
+    /// </returns>
+    protected virtual ValueTask<AIContext> ProvideAIContextAsync(InvokingContext context, CancellationToken cancellationToken = default)
+    {
+        return new ValueTask<AIContext>(new AIContext());
+    }
+
+    /// <summary>
+    /// Called at the end of the agent invocation to process the invocation results.
+    /// </summary>
+    /// <param name="context">Contains the invocation context including request messages, response messages, and any exception that occurred.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
+    /// <remarks>
+    /// <para>
+    /// Implementers can use the request and response messages in the provided <paramref name="context"/> to:
+    /// <list type="bullet">
+    /// <item><description>Update state based on conversation outcomes</description></item>
+    /// <item><description>Extract and store memories or preferences from user messages</description></item>
+    /// <item><description>Log or audit conversation details</description></item>
+    /// <item><description>Perform cleanup or finalization tasks</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// The <see cref="AIContextProvider"/> is passed a reference to the <see cref="AgentSession"/> via <see cref="InvokingContext"/> and <see cref="InvokedContext"/>
+    /// allowing it to store state in the <see cref="AgentSession.StateBag"/>. Since an <see cref="AIContextProvider"/> is used with many different sessions, it should
+    /// not store any session-specific information within its own instance fields. Instead, any session-specific state should be stored in the associated <see cref="AgentSession.StateBag"/>.
+    /// </para>
+    /// <para>
+    /// This method is called regardless of whether the invocation succeeded or failed.
+    /// To check if the invocation was successful, inspect the <see cref="InvokedContext.InvokeException"/> property.
+    /// </para>
+    /// </remarks>
+    public ValueTask InvokedAsync(InvokedContext context, CancellationToken cancellationToken = default)
+        => this.InvokedCoreAsync(Throw.IfNull(context), cancellationToken);
+
+    /// <summary>
+    /// Called at the end of the agent invocation to process the invocation results.
     /// </summary>
     /// <param name="context">Contains the invocation context including request messages, response messages, and any exception that occurred.</param>
     /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
@@ -73,21 +256,52 @@ public abstract class AIContextProvider
     /// This method is called regardless of whether the invocation succeeded or failed.
     /// To check if the invocation was successful, inspect the <see cref="InvokedContext.InvokeException"/> property.
     /// </para>
+    /// <para>
+    /// The default implementation of this method skips execution for any invocation failures,
+    /// filters the request messages using the configured store-input request message filter
+    /// (which defaults to including only <see cref="AgentRequestMessageSourceType.External"/> messages),
+    /// filters the response messages using the configured store-input response message filter
+    /// (which defaults to a no-op, so all response messages are processed),
+    /// and calls <see cref="StoreAIContextAsync"/> to process the invocation results.
+    /// For most scenarios, overriding <see cref="StoreAIContextAsync"/> is sufficient to process invocation results,
+    /// while still benefiting from the default error handling and filtering behavior.
+    /// However, for scenarios that require more control over error handling or message filtering, overriding this method
+    /// allows you to directly control the processing of invocation results.
+    /// </para>
     /// </remarks>
-    public virtual ValueTask InvokedAsync(InvokedContext context, CancellationToken cancellationToken = default)
-        => default;
+    protected virtual ValueTask InvokedCoreAsync(InvokedContext context, CancellationToken cancellationToken = default)
+    {
+        if (context.InvokeException is not null)
+        {
+            return default;
+        }
+
+        var subContext = new InvokedContext(context.Agent, context.Session, this.StoreInputRequestMessageFilter(context.RequestMessages), this.StoreInputResponseMessageFilter(context.ResponseMessages!));
+        return this.StoreAIContextAsync(subContext, cancellationToken);
+    }
 
     /// <summary>
-    /// Serializes the current object's state to a <see cref="JsonElement"/> using the specified serialization options.
+    /// When overridden in a derived class, processes invocation results at the end of the agent invocation.
     /// </summary>
-    /// <param name="jsonSerializerOptions">The JSON serialization options to use for the serialization process.</param>
-    /// <returns>A <see cref="JsonElement"/> representation of the object's state, or a default <see cref="JsonElement"/> if the provider has no serializable state.</returns>
+    /// <param name="context">Contains the invocation context including request messages, response messages, and any exception that occurred.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     /// <remarks>
-    /// The default implementation returns a default <see cref="JsonElement"/>. Override this method if the provider
-    /// maintains state that should be preserved across sessions or distributed scenarios.
+    /// <para>
+    /// This method is called from <see cref="InvokedCoreAsync"/>.
+    /// Note that <see cref="InvokedCoreAsync"/> can be overridden to directly control error handling, in which case
+    /// it is up to the implementer to call this method as needed to process the invocation results.
+    /// </para>
+    /// <para>
+    /// In contrast with <see cref="InvokedCoreAsync"/>, this method only processes the invocation results,
+    /// while <see cref="InvokedCoreAsync"/> is also responsible for error handling.
+    /// </para>
+    /// <para>
+    /// The default implementation of <see cref="InvokedCoreAsync"/> only calls this method if the invocation succeeded.
+    /// </para>
     /// </remarks>
-    public virtual JsonElement Serialize(JsonSerializerOptions? jsonSerializerOptions = null)
-        => default;
+    protected virtual ValueTask StoreAIContextAsync(InvokedContext context, CancellationToken cancellationToken = default) =>
+        default;
 
     /// <summary>Asks the <see cref="AIContextProvider"/> for an object of the specified type <paramref name="serviceType"/>.</summary>
     /// <param name="serviceType">The type of object being requested.</param>
@@ -120,72 +334,141 @@ public abstract class AIContextProvider
         => this.GetService(typeof(TService), serviceKey) is TService service ? service : default;
 
     /// <summary>
-    /// Contains the context information provided to <see cref="InvokingAsync(InvokingContext, CancellationToken)"/>.
+    /// Contains the context information provided to <see cref="InvokingCoreAsync(InvokingContext, CancellationToken)"/>.
     /// </summary>
     /// <remarks>
-    /// This class provides context about the upcoming AI model or agent invocation, including the messages
-    /// that will be sent. Context providers can use this information to determine what additional context
+    /// This class provides context about the invocation before the underlying AI model is invoked, including the messages
+    /// that will be used. Context providers can use this information to determine what additional context
     /// should be provided for the invocation.
     /// </remarks>
-    public class InvokingContext
+    public sealed class InvokingContext
     {
         /// <summary>
-        /// Initializes a new instance of the <see cref="InvokingContext"/> class with the specified request messages.
+        /// Initializes a new instance of the <see cref="InvokingContext"/> class.
         /// </summary>
-        /// <param name="requestMessages">The messages to be sent to the AI model or agent for this invocation.</param>
-        /// <exception cref="ArgumentNullException"><paramref name="requestMessages"/> is <see langword="null"/>.</exception>
-        public InvokingContext(IEnumerable<ChatMessage> requestMessages)
+        /// <param name="agent">The agent being invoked.</param>
+        /// <param name="session">The session associated with the agent invocation.</param>
+        /// <param name="aiContext">The AI context to be used by the agent for this invocation.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="agent"/> or <paramref name="aiContext"/> is <see langword="null"/>.</exception>
+        public InvokingContext(
+            AIAgent agent,
+            AgentSession? session,
+            AIContext aiContext)
         {
-            this.RequestMessages = requestMessages ?? throw new ArgumentNullException(nameof(requestMessages));
+            this.Agent = Throw.IfNull(agent);
+            this.Session = session;
+            this.AIContext = Throw.IfNull(aiContext);
         }
 
         /// <summary>
-        /// Gets the messages that will be sent to the AI model or agent for this invocation.
+        /// Gets the agent that is being invoked.
         /// </summary>
-        /// <value>
-        /// A collection of <see cref="ChatMessage"/> instances representing the conversation history
-        /// and new messages that will be processed by the AI model or agent.
-        /// </value>
-        public IEnumerable<ChatMessage> RequestMessages { get; }
+        public AIAgent Agent { get; }
+
+        /// <summary>
+        /// Gets the agent session associated with the agent invocation.
+        /// </summary>
+        public AgentSession? Session { get; }
+
+        /// <summary>
+        /// Gets the <see cref="AIContext"/> being built for the current invocation. Context providers can modify
+        /// and return or return a new <see cref="AIContext"/> instance to provide additional context for the invocation.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// If multiple <see cref="AIContextProvider"/> instances are used in the same invocation, each <see cref="AIContextProvider"/>
+        /// will receive the context returned by the previous <see cref="AIContextProvider"/> allowing them to build on top of each other's context.
+        /// </para>
+        /// <para>
+        /// The first <see cref="AIContextProvider"/> in the invocation pipeline will receive an <see cref="AIContext"/> instance
+        /// that already contains the caller provided messages that will be used by the agent for this invocation.
+        /// </para>
+        /// <para>
+        /// It may also contain messages from chat history, if a <see cref="ChatHistoryProvider"/> is being used.
+        /// </para>
+        /// </remarks>
+        public AIContext AIContext { get; }
     }
 
     /// <summary>
-    /// Contains the context information provided to <see cref="InvokedAsync(InvokedContext, CancellationToken)"/>.
+    /// Contains the context information provided to <see cref="InvokedCoreAsync(InvokedContext, CancellationToken)"/>.
     /// </summary>
     /// <remarks>
-    /// This class provides context about a completed AI model or agent invocation, including both the
-    /// request messages that were sent and the response messages that were generated. It also indicates
-    /// whether the invocation succeeded or failed.
+    /// This class provides context about a completed agent invocation, including the accumulated
+    /// request messages (user input, chat history and any others provided by AI context providers) that were used
+    /// and the response messages that were generated. It also indicates whether the invocation succeeded or failed.
     /// </remarks>
-    public class InvokedContext
+    public sealed class InvokedContext
     {
         /// <summary>
-        /// Initializes a new instance of the <see cref="InvokedContext"/> class with the specified request messages.
+        /// Initializes a new instance of the <see cref="InvokedContext"/> class for a successful invocation.
         /// </summary>
-        /// <param name="requestMessages">The messages that were sent to the AI model or agent for this invocation.</param>
-        /// <exception cref="ArgumentNullException"><paramref name="requestMessages"/> is <see langword="null"/>.</exception>
-        public InvokedContext(IEnumerable<ChatMessage> requestMessages)
+        /// <param name="agent">The agent that was invoked.</param>
+        /// <param name="session">The session associated with the agent invocation.</param>
+        /// <param name="requestMessages">The accumulated request messages (user input, chat history and any others provided by AI context providers)
+        /// that were used by the agent for this invocation.</param>
+        /// <param name="responseMessages">The response messages generated during this invocation.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="agent"/>, <paramref name="requestMessages"/>, or <paramref name="responseMessages"/> is <see langword="null"/>.</exception>
+        public InvokedContext(
+            AIAgent agent,
+            AgentSession? session,
+            IEnumerable<ChatMessage> requestMessages,
+            IEnumerable<ChatMessage> responseMessages)
         {
-            this.RequestMessages = requestMessages ?? throw new ArgumentNullException(nameof(requestMessages));
+            this.Agent = Throw.IfNull(agent);
+            this.Session = session;
+            this.RequestMessages = Throw.IfNull(requestMessages);
+            this.ResponseMessages = Throw.IfNull(responseMessages);
         }
 
         /// <summary>
-        /// Gets the messages that were sent to the AI model or agent for this invocation.
+        /// Initializes a new instance of the <see cref="InvokedContext"/> class for a failed invocation.
+        /// </summary>
+        /// <param name="agent">The agent that was invoked.</param>
+        /// <param name="session">The session associated with the agent invocation.</param>
+        /// <param name="requestMessages">The accumulated request messages (user input, chat history and any others provided by AI context providers)
+        /// that were used by the agent for this invocation.</param>
+        /// <param name="invokeException">The exception that caused the invocation to fail.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="agent"/>, <paramref name="requestMessages"/>, or <paramref name="invokeException"/> is <see langword="null"/>.</exception>
+        public InvokedContext(
+            AIAgent agent,
+            AgentSession? session,
+            IEnumerable<ChatMessage> requestMessages,
+            Exception invokeException)
+        {
+            this.Agent = Throw.IfNull(agent);
+            this.Session = session;
+            this.RequestMessages = Throw.IfNull(requestMessages);
+            this.InvokeException = Throw.IfNull(invokeException);
+        }
+
+        /// <summary>
+        /// Gets the agent that is being invoked.
+        /// </summary>
+        public AIAgent Agent { get; }
+
+        /// <summary>
+        /// Gets the agent session associated with the agent invocation.
+        /// </summary>
+        public AgentSession? Session { get; }
+
+        /// <summary>
+        /// Gets the accumulated request messages (user input, chat history and any others provided by AI context providers)
+        /// that were used by the agent for this invocation.
         /// </summary>
         /// <value>
-        /// A collection of <see cref="ChatMessage"/> instances representing the conversation history
-        /// and new messages that were processed by the AI model or agent.
+        /// A collection of <see cref="ChatMessage"/> instances representing all messages that were used by the agent for this invocation.
         /// </value>
         public IEnumerable<ChatMessage> RequestMessages { get; }
 
         /// <summary>
-        /// Gets the collection of response messages generated by the AI model or agent if the invocation succeeded.
+        /// Gets the collection of response messages generated during this invocation if the invocation succeeded.
         /// </summary>
         /// <value>
-        /// A collection of <see cref="ChatMessage"/> instances representing the response from the AI model or agent,
-        /// or <see langword="null"/> if the invocation failed or did not produce response messages.
+        /// A collection of <see cref="ChatMessage"/> instances representing the response,
+        /// or <see langword="null"/> if the invocation failed.
         /// </value>
-        public IEnumerable<ChatMessage>? ResponseMessages { get; init; }
+        public IEnumerable<ChatMessage>? ResponseMessages { get; }
 
         /// <summary>
         /// Gets the <see cref="Exception"/> that was thrown during the invocation, if the invocation failed.
@@ -193,6 +476,6 @@ public abstract class AIContextProvider
         /// <value>
         /// The exception that caused the invocation to fail, or <see langword="null"/> if the invocation succeeded.
         /// </value>
-        public Exception? InvokeException { get; init; }
+        public Exception? InvokeException { get; }
     }
 }

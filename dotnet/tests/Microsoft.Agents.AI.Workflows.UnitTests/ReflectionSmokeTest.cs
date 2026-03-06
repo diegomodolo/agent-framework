@@ -1,5 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+#pragma warning disable CS0618 // Type or member is obsolete - Testing legacy reflection-based pattern
+
 using System;
 using System.Threading;
 using System.Threading.Tasks;
@@ -35,7 +37,7 @@ public class DefaultHandler() : BaseTestExecutor<DefaultHandler>(nameof(DefaultH
     } = (message, context) => default;
 }
 
-public class TypedHandler<TInput>() : BaseTestExecutor<TypedHandler<TInput>>(nameof(TypedHandler<TInput>)), IMessageHandler<TInput>
+public class TypedHandler<TInput>() : BaseTestExecutor<TypedHandler<TInput>>(nameof(TypedHandler<>)), IMessageHandler<TInput>
 {
     public ValueTask HandleAsync(TInput message, IWorkflowContext context, CancellationToken cancellationToken = default)
     {
@@ -50,7 +52,7 @@ public class TypedHandler<TInput>() : BaseTestExecutor<TypedHandler<TInput>>(nam
     } = (message, context) => default;
 }
 
-public class TypedHandlerWithOutput<TInput, TResult>() : BaseTestExecutor<TypedHandlerWithOutput<TInput, TResult>>(nameof(TypedHandlerWithOutput<TInput, TResult>)), IMessageHandler<TInput, TResult>
+public class TypedHandlerWithOutput<TInput, TResult>() : BaseTestExecutor<TypedHandlerWithOutput<TInput, TResult>>(nameof(TypedHandlerWithOutput<,>)), IMessageHandler<TInput, TResult>
 {
     public ValueTask<TResult> HandleAsync(TInput message, IWorkflowContext context, CancellationToken cancellationToken)
     {

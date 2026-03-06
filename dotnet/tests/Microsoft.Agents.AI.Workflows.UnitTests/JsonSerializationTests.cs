@@ -118,7 +118,7 @@ public class JsonSerializationTests
         RunJsonRoundtrip(TestFanOutEdgeInfo_Assigner, predicate: TestFanOutEdgeInfo_Assigner.CreateValidator());
     }
 
-    private static FanInEdgeData TestFanInEdgeData => new(["SourceExecutor1", "SourceExecutor2"], "TargetExecutor", TakeEdgeId());
+    private static FanInEdgeData TestFanInEdgeData => new(["SourceExecutor1", "SourceExecutor2"], "TargetExecutor", TakeEdgeId(), null);
     private static FanInEdgeInfo TestFanInEdgeInfo => new(TestFanInEdgeData);
 
     [Fact]
@@ -155,7 +155,7 @@ public class JsonSerializationTests
     private static RequestPortInfo IntToString => RequestPort.Create<int, string>(IntToStringId).ToPortInfo();
     private static RequestPortInfo StringToInt => RequestPort.Create<string, int>(StringToIntId).ToPortInfo();
 
-    private static ValueTask<Workflow<string>> CreateTestWorkflowAsync()
+    private static Workflow CreateTestWorkflow()
     {
         ForwardMessageExecutor<string> forwardString = new(ForwardStringId);
         ForwardMessageExecutor<int> forwardInt = new(ForwardIntId);
@@ -167,14 +167,14 @@ public class JsonSerializationTests
         builder.AddEdge(forwardString, stringToInt)
                .AddEdge(stringToInt, forwardInt)
                .AddEdge(forwardInt, intToString)
-               .AddEdge(intToString, StreamingAggregators.Last<int>().AsExecutor("Aggregate"));
+               .AddEdge(intToString, StreamingAggregators.Last<int>().BindAsExecutor("Aggregate"));
 
-        return builder.BuildAsync<string>();
+        return builder.Build();
     }
 
-    internal static async ValueTask<WorkflowInfo> CreateTestWorkflowInfoAsync()
+    internal static WorkflowInfo CreateTestWorkflowInfo()
     {
-        Workflow<string> testWorkflow = await CreateTestWorkflowAsync().ConfigureAwait(false);
+        Workflow testWorkflow = CreateTestWorkflow();
         return testWorkflow.ToWorkflowInfo();
     }
 
@@ -232,7 +232,7 @@ public class JsonSerializationTests
     [Fact]
     public async Task Test_WorkflowInfo_JsonRoundtripAsync()
     {
-        WorkflowInfo prototype = await CreateTestWorkflowInfoAsync();
+        WorkflowInfo prototype = CreateTestWorkflowInfo();
 
         JsonMarshaller marshaller = new();
 
@@ -634,13 +634,8 @@ public class JsonSerializationTests
 
     private static CheckpointInfo TestParentCheckpointInfo => new(s_runId, s_parentCheckpointId);
 
-    [Fact]
-    public async Task Test_Checkpoint_JsonRoundTripAsync()
+    private static void ValidateCheckpoint(Checkpoint result, Checkpoint prototype)
     {
-        WorkflowInfo testWorkflowInfo = await CreateTestWorkflowInfoAsync();
-        Checkpoint prototype = new(12, testWorkflowInfo, TestRunnerStateData, TestStateData, TestEdgeState, TestParentCheckpointInfo);
-        Checkpoint result = RunJsonRoundtrip(prototype, TestCustomSerializedJsonOptions);
-
         result.Should().Match((Checkpoint checkpoint) => checkpoint.StepNumber == prototype.StepNumber);
 
         result.Parent.Should().Be(prototype.Parent);
@@ -649,5 +644,132 @@ public class JsonSerializationTests
         ValidateRunnerStateData(result.RunnerData, prototype.RunnerData);
         ValidateStateData(result.StateData, prototype.StateData);
         ValidateEdgeStateData(result.EdgeStateData, prototype.EdgeStateData);
+    }
+
+    [Fact]
+    public async Task Test_Checkpoint_JsonRoundTripAsync()
+    {
+        WorkflowInfo testWorkflowInfo = CreateTestWorkflowInfo();
+        Checkpoint prototype = new(12, testWorkflowInfo, TestRunnerStateData, TestStateData, TestEdgeState, TestParentCheckpointInfo);
+        Checkpoint result = RunJsonRoundtrip(prototype, TestCustomSerializedJsonOptions);
+
+        ValidateCheckpoint(result, prototype);
+    }
+
+    [Fact]
+    public async Task Test_InMemoryCheckpointManager_JsonRoundTripAsync()
+    {
+        WorkflowInfo testWorkflowInfo = CreateTestWorkflowInfo();
+        Checkpoint prototype = new(12, testWorkflowInfo, TestRunnerStateData, TestStateData, TestEdgeState, TestParentCheckpointInfo);
+        string runId = Guid.NewGuid().ToString("N");
+
+        InMemoryCheckpointManager manager = new();
+        CheckpointInfo checkpointInfo = await manager.CommitCheckpointAsync(runId, prototype);
+
+        InMemoryCheckpointManager result = RunJsonRoundtrip(manager, TestCustomSerializedJsonOptions);
+
+        Checkpoint? retrievedCheckpoint = await result.LookupCheckpointAsync(runId, checkpointInfo);
+
+        ValidateCheckpoint(retrievedCheckpoint, prototype);
+    }
+
+    /// <summary>
+    /// Verifies that the default behavior (without AllowOutOfOrderMetadataProperties) fails
+    /// when $type metadata is not the first property, demonstrating the PostgreSQL jsonb issue.
+    /// See: https://github.com/microsoft/agent-framework/issues/2962
+    /// </summary>
+    [Fact]
+    public void Test_OutOfOrderMetadataProperties_WithoutOption_Fails()
+    {
+        // Arrange
+        JsonMarshaller marshaller = new();
+        EdgeInfo edgeInfo = TestEdgeInfo_DirectNoCondition;
+
+        // Serialize to JSON
+        JsonElement serialized = marshaller.Marshal(edgeInfo);
+        string json = serialized.GetRawText();
+
+        // Simulate PostgreSQL jsonb behavior: reorder properties so $type is not first
+        string reorderedJson = ReorderJsonPropertiesToMoveTypeDiscriminatorLast(json);
+
+        // Act & Assert - Without the option, deserialization should fail
+        JsonElement reorderedElement = JsonDocument.Parse(reorderedJson).RootElement;
+        Action act = () => marshaller.Marshal<EdgeInfo>(reorderedElement);
+
+        act.Should().Throw<JsonException>();
+    }
+
+    /// <summary>
+    /// Simulates PostgreSQL jsonb behavior where property order is not preserved,
+    /// causing $type metadata to not be the first property.
+    /// This test verifies that deserialization works when AllowOutOfOrderMetadataProperties is enabled.
+    /// See: https://github.com/microsoft/agent-framework/issues/2962
+    /// </summary>
+    [Fact]
+    public void Test_OutOfOrderMetadataProperties_WithOptionEnabled_Succeeds()
+    {
+        // Arrange
+        EdgeInfo edgeInfo = TestEdgeInfo_DirectNoCondition;
+
+        // Serialize to JSON using standard marshaller
+        JsonMarshaller marshaller = new();
+        JsonElement serialized = marshaller.Marshal(edgeInfo);
+        string json = serialized.GetRawText();
+
+        // Simulate PostgreSQL jsonb behavior: reorder properties so $type is not first
+        string reorderedJson = ReorderJsonPropertiesToMoveTypeDiscriminatorLast(json);
+        JsonElement reorderedElement = JsonDocument.Parse(reorderedJson).RootElement;
+
+        // Act - Deserialize with AllowOutOfOrderMetadataProperties enabled via JsonSerializerOptions
+        JsonSerializerOptions options = new() { AllowOutOfOrderMetadataProperties = true };
+        JsonMarshaller marshallerWithOption = new(options);
+        EdgeInfo deserialized = marshallerWithOption.Marshal<EdgeInfo>(reorderedElement);
+
+        // Assert
+        deserialized.Should().Match(edgeInfo.CreatePolyValidator());
+    }
+
+    private static string ReorderJsonPropertiesToMoveTypeDiscriminatorLast(string json)
+    {
+        // Parse JSON, extract $type, rebuild with $type at end
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement root = doc.RootElement;
+
+        Dictionary<string, JsonElement> properties = [];
+        JsonElement? typeValue = null;
+
+        foreach (JsonProperty prop in root.EnumerateObject())
+        {
+            if (prop.Name == "$type")
+            {
+                typeValue = prop.Value.Clone();
+            }
+            else
+            {
+                properties[prop.Name] = prop.Value.Clone();
+            }
+        }
+
+        // Rebuild JSON with $type last
+        using System.IO.MemoryStream ms = new();
+        using (Utf8JsonWriter writer = new(ms))
+        {
+            writer.WriteStartObject();
+            foreach (KeyValuePair<string, JsonElement> kvp in properties)
+            {
+                writer.WritePropertyName(kvp.Key);
+                kvp.Value.WriteTo(writer);
+            }
+
+            if (typeValue.HasValue)
+            {
+                writer.WritePropertyName("$type");
+                typeValue.Value.WriteTo(writer);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 }

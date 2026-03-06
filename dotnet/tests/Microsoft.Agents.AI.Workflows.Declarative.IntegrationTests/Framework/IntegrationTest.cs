@@ -1,17 +1,14 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
-using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Threading.Tasks;
-using Azure.Identity;
 using Microsoft.Agents.AI.Workflows.Declarative.PowerFx;
-using Microsoft.Bot.ObjectModel;
+using Microsoft.Agents.ObjectModel;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Shared.IntegrationTests;
-using Xunit.Abstractions;
 
 namespace Microsoft.Agents.AI.Workflows.Declarative.IntegrationTests.Framework;
 
@@ -20,26 +17,19 @@ namespace Microsoft.Agents.AI.Workflows.Declarative.IntegrationTests.Framework;
 /// </summary>
 public abstract class IntegrationTest : IDisposable
 {
-    private IConfigurationRoot? _configuration;
-    private AzureAIConfiguration? _foundryConfiguration;
+    protected IConfigurationRoot Configuration => field ??= InitializeConfig();
 
-    protected IConfigurationRoot Configuration => this._configuration ??= InitializeConfig();
-
-    internal AzureAIConfiguration FoundryConfiguration
-    {
-        get
-        {
-            this._foundryConfiguration ??= this.Configuration.GetSection("AzureAI").Get<AzureAIConfiguration>();
-            Assert.NotNull(this._foundryConfiguration);
-            return this._foundryConfiguration;
-        }
-    }
+    public Uri TestEndpoint { get; }
 
     public TestOutputAdapter Output { get; }
 
     protected IntegrationTest(ITestOutputHelper output)
     {
         this.Output = new TestOutputAdapter(output);
+        this.TestEndpoint =
+            new Uri(
+                this.Configuration?[TestSettings.AzureAIProjectEndpoint] ??
+                throw new InvalidOperationException($"Undefined configuration setting: {TestSettings.AzureAIProjectEndpoint}"));
         Console.SetOut(this.Output);
         SetProduct();
     }
@@ -70,15 +60,13 @@ public abstract class IntegrationTest : IDisposable
 
     protected async ValueTask<DeclarativeWorkflowOptions> CreateOptionsAsync(bool externalConversation = false, params IEnumerable<AIFunction> functionTools)
     {
-        FrozenDictionary<string, string?> agentMap = await AgentFactory.GetAgentsAsync(this.FoundryConfiguration, this.Configuration);
+        return await this.CreateOptionsAsync(externalConversation, mcpToolProvider: null, functionTools).ConfigureAwait(false);
+    }
 
-        IConfiguration workflowConfig =
-            new ConfigurationBuilder()
-                .AddInMemoryCollection(agentMap)
-                .Build();
-
+    protected async ValueTask<DeclarativeWorkflowOptions> CreateOptionsAsync(bool externalConversation, IMcpToolHandler? mcpToolProvider, params IEnumerable<AIFunction> functionTools)
+    {
         AzureAgentProvider agentProvider =
-            new(this.FoundryConfiguration.Endpoint, new AzureCliCredential())
+            new(this.TestEndpoint, TestAzureCliCredentials.CreateAzureCliCredential())
             {
                 Functions = functionTools,
             };
@@ -92,15 +80,14 @@ public abstract class IntegrationTest : IDisposable
         return
             new DeclarativeWorkflowOptions(agentProvider)
             {
-                Configuration = workflowConfig,
                 ConversationId = conversationId,
-                LoggerFactory = this.Output
+                LoggerFactory = this.Output,
+                McpToolHandler = mcpToolProvider
             };
     }
 
     private static IConfigurationRoot InitializeConfig() =>
         new ConfigurationBuilder()
-            .AddJsonFile("appsettings.Development.json", true)
             .AddEnvironmentVariables()
             .AddUserSecrets(Assembly.GetExecutingAssembly())
             .Build();

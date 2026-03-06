@@ -1,19 +1,17 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Unified Purview model definitions and public export surface."""
-
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping, Sequence
+import logging
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from datetime import datetime
 from enum import Enum, Flag, auto
 from typing import Any, ClassVar, TypeVar, cast
 from uuid import uuid4
 
-from agent_framework._logging import get_logger
 from agent_framework._serialization import SerializationMixin
 
-logger = get_logger("agent_framework.purview")
+logger = logging.getLogger("agent_framework.purview")
 
 # --------------------------------------------------------------------------------------
 # Enums & flag helpers
@@ -62,6 +60,23 @@ _PROTECTION_SCOPE_ACTIVITIES_SERIALIZE_ORDER: list[tuple[str, ProtectionScopeAct
 ]
 
 
+def _as_object_list(value: object) -> list[object] | None:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    return list(cast(Iterable[object], value))
+
+
+def _as_str_dict(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+
+    aliases: dict[str, str] = {}
+    for raw_key, raw_value in cast(dict[object, object], value).items():
+        if isinstance(raw_key, str) and isinstance(raw_value, str):
+            aliases[raw_key] = raw_value
+    return aliases
+
+
 def deserialize_flag(
     value: object, mapping: Mapping[str, FlagT], enum_cls: type[FlagT]
 ) -> FlagT | None:  # pragma: no cover
@@ -84,8 +99,11 @@ def deserialize_flag(
         if not raw:
             return enum_cls(0)
         parts.extend([p.strip() for p in raw.split(",") if p.strip()])
-    elif isinstance(value, (list, tuple, set)):
-        for item in value:
+    else:
+        iterable_items = _as_object_list(value)
+        if iterable_items is None:
+            return None
+        for item in iterable_items:
             if isinstance(item, str):
                 parts.extend([p.strip() for p in item.split(",") if p.strip()])
             elif isinstance(item, enum_cls):
@@ -95,8 +113,6 @@ def deserialize_flag(
                     flag_value |= enum_cls(item)
                 except Exception:
                     logger.warning(f"Failed to convert int {item} to {enum_cls.__name__}")
-    else:
-        return None
 
     for part in parts:
         member = mapping.get(part)
@@ -179,6 +195,8 @@ def translate_activity(activity: Activity) -> ProtectionScopeActivities:
 # Simple value models
 # --------------------------------------------------------------------------------------
 
+AliasSerializableT = TypeVar("AliasSerializableT", bound="_AliasSerializable")
+
 
 class _AliasSerializable(SerializationMixin):
     """Base class adding alias mapping + pydantic-compat helpers.
@@ -196,10 +214,10 @@ class _AliasSerializable(SerializationMixin):
         # Collect all aliases from parent classes too
         all_aliases: dict[str, str] = {}
         for cls in type(self).__mro__:
-            if hasattr(cls, "_ALIASES") and isinstance(cls._ALIASES, dict):
-                for internal, external in cls._ALIASES.items():
-                    if external not in all_aliases:
-                        all_aliases[external] = internal
+            aliases_obj = _as_str_dict(getattr(cls, "_ALIASES", None))
+            for internal, external in aliases_obj.items():
+                if external not in all_aliases:
+                    all_aliases[external] = internal
 
         # Normalize all aliased keys in kwargs
         for external, internal in all_aliases.items():
@@ -232,7 +250,7 @@ class _AliasSerializable(SerializationMixin):
         return json.dumps(self.model_dump(by_alias=by_alias, exclude_none=exclude_none, **kwargs))
 
     @classmethod
-    def model_validate(cls, value: MutableMapping[str, Any]) -> _AliasSerializable:  # type: ignore[name-defined]
+    def model_validate(cls: type[AliasSerializableT], value: MutableMapping[str, Any]) -> AliasSerializableT:  # type: ignore[name-defined]
         return cls(**value)
 
     # ------------------------------------------------------------------
@@ -248,11 +266,11 @@ class _AliasSerializable(SerializationMixin):
         # Collect all aliases from class hierarchy
         all_aliases: dict[str, str] = {}
         for cls in type(self).__mro__:
-            if hasattr(cls, "_ALIASES") and isinstance(cls._ALIASES, dict):
-                # Parent aliases first (will be overridden by child if same key)
-                for internal, external in cls._ALIASES.items():
-                    if internal not in all_aliases:
-                        all_aliases[internal] = external
+            aliases_obj = _as_str_dict(getattr(cls, "_ALIASES", None))
+            # Parent aliases first (will be overridden by child if same key)
+            for internal, external in aliases_obj.items():
+                if internal not in all_aliases:
+                    all_aliases[internal] = external
 
         if not all_aliases:
             return base
@@ -642,7 +660,9 @@ class ContentToProcess(_AliasSerializable):
 
 class ProcessContentRequest(_AliasSerializable):
     _ALIASES: ClassVar[dict[str, str]] = {"content_to_process": "contentToProcess"}
-    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"user_id", "tenant_id", "correlation_id", "process_inline"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {
+        "correlation_id",
+    }
 
     def __init__(
         self,
@@ -651,6 +671,7 @@ class ProcessContentRequest(_AliasSerializable):
         tenant_id: str,
         correlation_id: str | None = None,
         process_inline: bool | None = None,
+        scope_identifier: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Extract aliased values from kwargs
@@ -668,10 +689,11 @@ class ProcessContentRequest(_AliasSerializable):
         self.tenant_id = tenant_id
         self.correlation_id = correlation_id
         self.process_inline = process_inline
+        self.scope_identifier = scope_identifier
 
 
 class ProtectionScopesRequest(_AliasSerializable):
-    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"user_id", "tenant_id", "correlation_id", "scope_identifier"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
     _ALIASES: ClassVar[dict[str, str]] = {
         "pivot_on": "pivotOn",
         "device_metadata": "deviceMetadata",
@@ -743,7 +765,7 @@ class ContentActivitiesRequest(_AliasSerializable):
         "scope_identifier": "scopeIdentifier",
         "content_to_process": "contentMetadata",
     }
-    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"tenant_id", "correlation_id"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
 
     def __init__(
         self,
@@ -800,12 +822,15 @@ class ProcessContentResponse(_AliasSerializable):
         "protection_scope_state": "protectionScopeState",
         "policy_actions": "policyActions",
         "processing_errors": "processingErrors",
+        "correlation_id": "correlationId",
     }
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
 
     id: str | None
     protection_scope_state: ProtectionScopeState | None
     policy_actions: list[DlpActionInfo] | None
     processing_errors: list[ProcessingError] | None
+    correlation_id: str | None
 
     def __init__(
         self,
@@ -813,6 +838,7 @@ class ProcessContentResponse(_AliasSerializable):
         protection_scope_state: ProtectionScopeState | None = None,
         policy_actions: list[DlpActionInfo | MutableMapping[str, Any]] | None = None,
         processing_errors: list[ProcessingError | MutableMapping[str, Any]] | None = None,
+        correlation_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Extract aliased values from kwargs
@@ -822,28 +848,28 @@ class ProcessContentResponse(_AliasSerializable):
             policy_actions = kwargs["policyActions"]
         if "processingErrors" in kwargs:
             processing_errors = kwargs["processingErrors"]
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
 
         # Convert to objects
         converted_policy_actions: list[DlpActionInfo] | None = None
         if policy_actions is not None:
-            converted_policy_actions = cast(
-                list[DlpActionInfo],
-                [p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions],
-            )
+            converted_policy_actions = [
+                p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions
+            ]
 
         converted_processing_errors: list[ProcessingError] | None = None
         if processing_errors is not None:
-            converted_processing_errors = cast(
-                list[ProcessingError],
-                [pe if isinstance(pe, ProcessingError) else ProcessingError(**pe) for pe in processing_errors],
-            )
+            converted_processing_errors = [
+                pe if isinstance(pe, ProcessingError) else ProcessingError(**pe) for pe in processing_errors
+            ]
 
-        # Call parent without explicit params with aliases
         super().__init__(**kwargs)
         self.id = id
         self.protection_scope_state = protection_scope_state
         self.policy_actions = converted_policy_actions
         self.processing_errors = converted_processing_errors
+        self.correlation_id = correlation_id
 
 
 class PolicyScope(_AliasSerializable):
@@ -875,17 +901,15 @@ class PolicyScope(_AliasSerializable):
         # Convert nested objects
         converted_locations: list[PolicyLocation] | None = None
         if locations is not None:
-            converted_locations = cast(
-                list[PolicyLocation],
-                [loc if isinstance(loc, PolicyLocation) else PolicyLocation(**loc) for loc in locations],
-            )
+            converted_locations = [
+                loc if isinstance(loc, PolicyLocation) else PolicyLocation(**loc) for loc in locations
+            ]
 
         converted_policy_actions: list[DlpActionInfo] | None = None
         if policy_actions is not None:
-            converted_policy_actions = cast(
-                list[DlpActionInfo],
-                [p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions],
-            )
+            converted_policy_actions = [
+                p if isinstance(p, DlpActionInfo) else DlpActionInfo(**p) for p in policy_actions
+            ]
 
         # Call parent without explicit params with aliases
         super().__init__(**kwargs)
@@ -909,15 +933,22 @@ class PolicyScope(_AliasSerializable):
 
 
 class ProtectionScopesResponse(_AliasSerializable):
-    _ALIASES: ClassVar[dict[str, str]] = {"scope_identifier": "scopeIdentifier", "scopes": "value"}
+    _ALIASES: ClassVar[dict[str, str]] = {
+        "scope_identifier": "scopeIdentifier",
+        "scopes": "value",
+        "correlation_id": "correlationId",
+    }
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
 
     scope_identifier: str | None
     scopes: list[PolicyScope] | None
+    correlation_id: str | None
 
     def __init__(
         self,
         scope_identifier: str | None = None,
         scopes: list[PolicyScope | MutableMapping[str, Any]] | None = None,
+        correlation_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Extract aliased values from kwargs before they're normalized by parent
@@ -925,33 +956,43 @@ class ProtectionScopesResponse(_AliasSerializable):
             scope_identifier = kwargs["scopeIdentifier"]
         if "value" in kwargs:
             scopes = kwargs["value"]
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
 
         converted_scopes: list[PolicyScope] | None = None
         if scopes is not None:
-            converted_scopes = cast(
-                list[PolicyScope], [s if isinstance(s, PolicyScope) else PolicyScope(**s) for s in scopes]
-            )
+            converted_scopes = [s if isinstance(s, PolicyScope) else PolicyScope(**s) for s in scopes]
 
         # Don't pass parameters that have aliases - let parent normalize them
         super().__init__(**kwargs)
         self.scope_identifier = scope_identifier
         self.scopes = converted_scopes
+        self.correlation_id = correlation_id
 
 
 class ContentActivitiesResponse(_AliasSerializable):
-    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"status_code"}
+    DEFAULT_EXCLUDE: ClassVar[set[str]] = {"correlation_id"}
+    _ALIASES: ClassVar[dict[str, str]] = {"correlation_id": "correlationId"}
+
+    status_code: int | None
+    error: ErrorDetails | None
+    correlation_id: str | None
 
     def __init__(
         self,
         status_code: int | None = None,
         error: ErrorDetails | MutableMapping[str, Any] | None = None,
+        correlation_id: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if "correlationId" in kwargs:
+            correlation_id = kwargs["correlationId"]
         if isinstance(error, MutableMapping):
             error = ErrorDetails(**error)
-        super().__init__(status_code=status_code, error=error, **kwargs)
+        super().__init__(status_code=status_code, error=error, correlation_id=correlation_id, **kwargs)
         self.status_code = status_code
         self.error = error  # type: ignore[assignment]
+        self.correlation_id = correlation_id
 
 
 __all__ = [

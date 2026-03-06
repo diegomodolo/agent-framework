@@ -1,5 +1,6 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Agents.AI.Workflows.Declarative.Entities;
@@ -8,14 +9,16 @@ using Microsoft.Agents.AI.Workflows.Declarative.Extensions;
 using Microsoft.Agents.AI.Workflows.Declarative.Interpreter;
 using Microsoft.Agents.AI.Workflows.Declarative.Kit;
 using Microsoft.Agents.AI.Workflows.Declarative.PowerFx;
-using Microsoft.Bot.ObjectModel;
+using Microsoft.Agents.ObjectModel;
 using Microsoft.Extensions.AI;
 using Microsoft.PowerFx.Types;
 using Microsoft.Shared.Diagnostics;
 
 namespace Microsoft.Agents.AI.Workflows.Declarative.ObjectModel;
 
-internal sealed class QuestionExecutor(Question model, WorkflowAgentProvider agentProvider, WorkflowFormulaState state) :
+[SendsMessage(typeof(ExternalInputRequest))]
+[SendsMessage(typeof(ExternalInputResponse))]
+internal sealed class QuestionExecutor(Question model, ResponseAgentProvider agentProvider, WorkflowFormulaState state) :
     DeclarativeActionExecutor<Question>(model, state)
 {
     public static class Steps
@@ -43,18 +46,17 @@ internal sealed class QuestionExecutor(Question model, WorkflowAgentProvider age
         await this._promptCount.WriteAsync(context, 0).ConfigureAwait(false);
 
         InitializablePropertyPath variable = Throw.IfNull(this.Model.Variable);
-        bool hasValue = context.ReadState(variable.Path) is BlankValue;
-        bool alwaysPrompt = this.Evaluator.GetValue(this.Model.AlwaysPrompt).Value;
+        bool isValueUndefined = context.ReadState(variable.Path) is BlankValue;
+        bool proceed = this.Evaluator.GetValue(this.Model.AlwaysPrompt).Value;
 
-        bool proceed = !alwaysPrompt || hasValue;
-        if (proceed)
+        if (!proceed)
         {
             SkipQuestionMode mode = this.Evaluator.GetValue(this.Model.SkipQuestionMode).Value;
             proceed =
                 mode switch
                 {
-                    SkipQuestionMode.SkipOnFirstExecutionIfVariableHasValue => !await this._hasExecuted.ReadAsync(context).ConfigureAwait(false),
-                    SkipQuestionMode.AlwaysSkipIfVariableHasValue => hasValue,
+                    SkipQuestionMode.SkipOnFirstExecutionIfVariableHasValue => isValueUndefined && !await this._hasExecuted.ReadAsync(context).ConfigureAwait(false),
+                    SkipQuestionMode.AlwaysSkipIfVariableHasValue => isValueUndefined,
                     SkipQuestionMode.AlwaysAsk => true,
                     _ => true,
                 };
@@ -75,22 +77,22 @@ internal sealed class QuestionExecutor(Question model, WorkflowAgentProvider age
     public async ValueTask PrepareResponseAsync(IWorkflowContext context, ActionExecutorResult message, CancellationToken cancellationToken)
     {
         int count = await this._promptCount.ReadAsync(context).ConfigureAwait(false);
-        InputRequest inputRequest = new(this.FormatPrompt(this.Model.Prompt));
-        await context.SendMessageAsync(inputRequest, targetId: null, cancellationToken).ConfigureAwait(false);
+        ExternalInputRequest inputRequest = new(this.FormatPrompt(this.Model.Prompt));
+        await context.SendMessageAsync(inputRequest, cancellationToken).ConfigureAwait(false);
         await this._promptCount.WriteAsync(context, count + 1).ConfigureAwait(false);
     }
 
-    public async ValueTask CaptureResponseAsync(IWorkflowContext context, InputResponse message, CancellationToken cancellationToken)
+    public async ValueTask CaptureResponseAsync(IWorkflowContext context, ExternalInputResponse response, CancellationToken cancellationToken)
     {
         FormulaValue? extractedValue = null;
-        if (message.Value is null)
+        if (!response.HasMessages)
         {
-            string unrecognizedResponse = this.FormatPrompt(this.Model.UnrecognizedPrompt);
+            string unrecognizedResponse = this.Model.UnrecognizedPrompt is not null ? this.FormatPrompt(this.Model.UnrecognizedPrompt) : "Invalid response";
             await context.AddEventAsync(new MessageActivityEvent(unrecognizedResponse.Trim()), cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            EntityExtractionResult entityResult = EntityExtractor.Parse(this.Model.Entity, message.Value.Text);
+            EntityExtractionResult entityResult = EntityExtractor.Parse(this.Model.Entity, string.Concat(response.Messages.Select(message => message.Text)));
             if (entityResult.IsValid)
             {
                 extractedValue = entityResult.Value;
@@ -121,13 +123,13 @@ internal sealed class QuestionExecutor(Question model, WorkflowAgentProvider age
                 if (workflowConversationId is not null)
                 {
                     // Input message always defined if values has been extracted.
-                    ChatMessage input = message.Value!;
+                    ChatMessage input = response.Messages.Last();
                     await agentProvider.CreateMessageAsync(workflowConversationId, input, cancellationToken).ConfigureAwait(false);
                     await context.SetLastMessageAsync(input).ConfigureAwait(false);
                 }
             }
 
-            await this.AssignAsync(this.Model.Variable?.Path, extractedValue, context).ConfigureAwait(false);
+            await this.AssignAsync(Throw.IfNull(this.Model.Variable).Path, extractedValue, context).ConfigureAwait(false);
             await this._hasExecuted.WriteAsync(context, true).ConfigureAwait(false);
             await context.SendResultMessageAsync(this.Id, cancellationToken).ConfigureAwait(false);
         }
@@ -144,9 +146,13 @@ internal sealed class QuestionExecutor(Question model, WorkflowAgentProvider age
         int actualCount = await this._promptCount.ReadAsync(context).ConfigureAwait(false);
         if (actualCount >= repeatCount)
         {
-            ValueExpression defaultValueExpression = Throw.IfNull(this.Model.DefaultValue);
-            DataValue defaultValue = this.Evaluator.GetValue(defaultValueExpression).Value;
-            await this.AssignAsync(this.Model.Variable?.Path, defaultValue.ToFormula(), context).ConfigureAwait(false);
+            DataValue defaultValue = DataValue.Blank();
+            if (this.Model.DefaultValue is not null)
+            {
+                ValueExpression defaultValueExpression = Throw.IfNull(this.Model.DefaultValue);
+                defaultValue = this.Evaluator.GetValue(defaultValueExpression).Value;
+            }
+            await this.AssignAsync(Throw.IfNull(this.Model.Variable).Path, defaultValue.ToFormula(), context).ConfigureAwait(false);
             string defaultValueResponse = this.FormatPrompt(this.Model.DefaultValueResponse);
             await context.AddEventAsync(new MessageActivityEvent(defaultValueResponse.Trim()), cancellationToken).ConfigureAwait(false);
             await context.SendResultMessageAsync(this.Id, cancellationToken).ConfigureAwait(false);

@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using FluentAssertions;
+using Microsoft.Agents.AI.Workflows.InProc;
 using Microsoft.Agents.AI.Workflows.Sample;
 
 namespace Microsoft.Agents.AI.Workflows.UnitTests;
@@ -194,23 +195,28 @@ public class SampleSmokeTest
 
         Assert.Collection(lines,
             line => Assert.Contains($"{HelloAgent.DefaultId}: {HelloAgent.Greeting}", line),
-            line => Assert.Contains($"{EchoAgent.DefaultId}: {EchoAgent.Prefix}{HelloAgent.Greeting}", line)
+            line => Assert.Contains($"{Step6EntryPoint.EchoAgentId}: {Step6EntryPoint.EchoPrefix}{HelloAgent.Greeting}", line)
         );
     }
 
-    [Fact]
-    public async Task Test_RunSample_Step7Async()
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step7Async(ExecutionEnvironment environment)
     {
         using StringWriter writer = new();
 
-        await Step7EntryPoint.RunAsync(writer);
+        await Step7EntryPoint.RunAsync(writer, environment.ToWorkflowExecutionEnvironment());
 
         string result = writer.ToString();
         string[] lines = result.Split([Environment.NewLine], StringSplitOptions.RemoveEmptyEntries);
 
         Assert.Collection(lines,
             line => Assert.Contains($"{HelloAgent.DefaultId}: {HelloAgent.Greeting}", line),
-            line => Assert.Contains($"{EchoAgent.DefaultId}: {EchoAgent.Prefix}{HelloAgent.Greeting}", line)
+            line => Assert.Contains($"{Step7EntryPoint.EchoAgentId}: {Step7EntryPoint.EchoPrefix}{HelloAgent.Greeting}", line),
+            line => Assert.Contains($"{HelloAgent.DefaultId}: {HelloAgent.Greeting}", line),
+            line => Assert.Contains($"{Step7EntryPoint.EchoAgentId}: {Step7EntryPoint.EchoPrefix}{HelloAgent.Greeting}", line)
         );
     }
 
@@ -261,6 +267,228 @@ public class SampleSmokeTest
     {
         using StringWriter writer = new();
         _ = await Step9EntryPoint.RunAsync(writer, environment.ToWorkflowExecutionEnvironment());
+    }
+
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step10Async(ExecutionEnvironment environment)
+    {
+        List<string> inputs = ["1", "2", "3"];
+
+        using StringWriter writer = new();
+        await Step10EntryPoint.RunAsync(writer, environment.ToWorkflowExecutionEnvironment(), inputs);
+
+        string[] lines = writer.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+        Assert.Collection(lines,
+                          inputs.Select(CreateValidator).ToArray());
+
+        Action<string> CreateValidator(string expected) => actual => actual.Should().Be($"Echo: {expected}");
+    }
+
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step11Async(ExecutionEnvironment environment)
+    {
+        List<string> inputs = ["1", "2", "3"];
+
+        using StringWriter writer = new();
+        await Step11EntryPoint.RunAsync(writer, environment.ToWorkflowExecutionEnvironment(), inputs);
+
+        string[] lines = writer.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+        Array.Sort(lines, StringComparer.OrdinalIgnoreCase);
+
+        string[] expected = Enumerable.Range(1, Step11EntryPoint.AgentCount)
+                                      .SelectMany(agentNumber => inputs.Select(input => Step11EntryPoint.ExpectedOutputForInput(input, agentNumber)))
+                                      .ToArray();
+
+        Array.Sort(expected, StringComparer.OrdinalIgnoreCase);
+
+        Assert.Collection(lines,
+                          expected.Select(CreateValidator).ToArray());
+
+        Action<string> CreateValidator(string expected) => actual => actual.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step12Async(ExecutionEnvironment environment)
+    {
+        List<string> inputs = ["1", "2", "3"];
+
+        using StringWriter writer = new();
+        await Step12EntryPoint.RunAsync(writer, environment.ToWorkflowExecutionEnvironment(), inputs);
+
+        string[] lines = writer.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+
+        // The expectation is that each agent will echo each input along with every echo from previous agents
+        // E.g.:
+        // (user): 1
+        // (a1): 1:1
+        // (a2): 2:1
+        // (a2): 2:1:1
+
+        // If there were three agents, it would then be followed by:
+        // (a3): 3:1
+        // (a3): 3:1:1
+        // (a3): 3:2:1
+        // (a3): 3:2:1:1
+
+        string[] expected = inputs.SelectMany(input => EchoesForInput(input)).ToArray();
+
+        Console.Error.WriteLine("Expected lines: ");
+        foreach (string expectedLine in expected)
+        {
+            Console.Error.WriteLine($"\t{expectedLine}");
+        }
+
+        Console.Error.WriteLine("Actual lines: ");
+        foreach (string line in lines)
+        {
+            Console.Error.WriteLine($"\t{line}");
+        }
+
+        Assert.Collection(lines,
+                          expected.Select(CreateValidator).ToArray());
+
+        IEnumerable<string> EchoesForInput(string input)
+        {
+            List<string> echoes = [$"{Step12EntryPoint.EchoPrefixForAgent(1)}{input}"];
+            for (int i = 2; i <= Step12EntryPoint.AgentCount; i++)
+            {
+                string agentPrefix = Step12EntryPoint.EchoPrefixForAgent(i);
+                List<string> newEchoes = [$"{agentPrefix}{input}", .. echoes.Select(echo => $"{agentPrefix}{echo}")];
+                echoes.AddRange(newEchoes);
+            }
+
+            return echoes;
+        }
+
+        Action<string> CreateValidator(string expected) => actual => actual.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step13Async(ExecutionEnvironment environment)
+    {
+        CheckpointManager checkpointManager = CheckpointManager.CreateInMemory();
+        InProcessExecutionEnvironment executionEnvironment = environment.ToWorkflowExecutionEnvironment().WithCheckpointing(checkpointManager);
+
+        CheckpointInfo? resumeFrom = null;
+
+        await RunAndValidateAsync(1);
+
+        // this should crash before fix
+        await RunAndValidateAsync(2);
+
+        async ValueTask RunAndValidateAsync(int step)
+        {
+            using StringWriter writer = new();
+            string input = $"[{step}] Hello, World!";
+
+            resumeFrom = await Step13EntryPoint.RunAsync(writer, input, executionEnvironment, resumeFrom);
+
+            string result = writer.ToString();
+            string[] lines = result.Split([Environment.NewLine], StringSplitOptions.RemoveEmptyEntries);
+
+            const string ExpectedSource = "EchoSubworkflow";
+            Assert.Collection(lines,
+                line => Assert.Contains($"{ExpectedSource}: {input}", line)
+            );
+        }
+    }
+
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    [InlineData(ExecutionEnvironment.InProcess_Concurrent)]
+    internal async Task Test_RunSample_Step13aAsync(ExecutionEnvironment environment)
+    {
+        IWorkflowExecutionEnvironment executionEnvironment = environment.ToWorkflowExecutionEnvironment();
+        AgentSession? session = null;
+
+        await RunAndValidateAsync(1);
+
+        // this should crash before fix
+        await RunAndValidateAsync(2);
+
+        async ValueTask RunAndValidateAsync(int step)
+        {
+            using StringWriter writer = new();
+            string input = $"[{step}] Hello, World!";
+
+            session = await Step13EntryPoint.RunAsAgentAsync(writer, input, executionEnvironment, session);
+
+            string result = writer.ToString();
+            string[] lines = result.Split([Environment.NewLine], StringSplitOptions.RemoveEmptyEntries);
+
+            // We expect to get the message that was passed in directly; since we are passing it in as a string, there is no associated
+            // author information. The ExpectedSource is empty string.
+            const string ExpectedSource = "";
+            Assert.Collection(lines,
+                line => Assert.Contains($"{ExpectedSource}: {input}", line)
+            );
+        }
+    }
+
+    /// <summary>
+    /// Tests that shared state works WITHIN a subworkflow (internal persistence).
+    /// This verifies state written by one executor in a subworkflow can be read
+    /// by another executor in the SAME subworkflow.
+    /// </summary>
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    internal async Task Test_RunSample_Step14_SharedState_WorksWithinSubworkflowAsync(ExecutionEnvironment environment)
+    {
+        // Arrange
+        IWorkflowExecutionEnvironment executionEnvironment = environment.ToWorkflowExecutionEnvironment();
+        const string Text = "    Lorem ipsum dolor sit amet, consectetur adipiscing elit.  ";
+        int expectedCharCount = Text.Trim().Length;
+
+        // Act & Assert - All executors inside the subworkflow should share state
+        using StringWriter writer = new();
+        int result = await Step14EntryPoint.RunSubworkflowInternalStateAsync(Text, writer, executionEnvironment);
+        result.Should().Be(expectedCharCount, "executors within subworkflow should share state correctly");
+    }
+
+    /// <summary>
+    /// Documents that shared state is currently isolated across subworkflow boundaries.
+    /// This is the behavior reported in issue #2419.
+    /// When/if cross-boundary state sharing is implemented, this test should be updated
+    /// to expect success instead of failure.
+    /// </summary>
+    [Theory]
+    [InlineData(ExecutionEnvironment.InProcess_Lockstep)]
+    [InlineData(ExecutionEnvironment.InProcess_OffThread)]
+    internal async Task Test_RunSample_Step14a_SharedState_IsolatedAcrossSubworkflowBoundaryAsync(ExecutionEnvironment environment)
+    {
+        // Arrange
+        IWorkflowExecutionEnvironment executionEnvironment = environment.ToWorkflowExecutionEnvironment();
+        const string Text = "    Lorem ipsum dolor sit amet, consectetur adipiscing elit.  ";
+
+        // Act - Attempt to use shared state across parent/subworkflow boundary
+        using StringWriter writer = new();
+        Exception? error = await Step14EntryPoint.RunCrossBoundaryStateAsync(Text, writer, executionEnvironment);
+
+        // Assert - Currently, state is isolated across subworkflow boundaries (issue #2419)
+        // The subworkflow executor cannot see state written by the parent workflow
+        error.Should().NotBeNull("state written in parent workflow is not visible in subworkflow");
+
+        // The exception may be wrapped in TargetInvocationException, so check inner exception too
+        Exception actualError = error is System.Reflection.TargetInvocationException tie && tie.InnerException != null
+            ? tie.InnerException
+            : error;
+
+        actualError.Should().BeOfType<InvalidOperationException>();
     }
 }
 

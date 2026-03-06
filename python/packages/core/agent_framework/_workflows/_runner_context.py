@@ -1,35 +1,51 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+from __future__ import annotations
+
 import asyncio
 import logging
-import uuid
 from copy import copy
 from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict, TypeVar, cast, runtime_checkable
+from enum import Enum
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
-from ._checkpoint import CheckpointStorage, WorkflowCheckpoint
-from ._checkpoint_encoding import decode_checkpoint_value, encode_checkpoint_value
-from ._const import DEFAULT_MAX_ITERATIONS
+from ._checkpoint import CheckpointID, CheckpointStorage, WorkflowCheckpoint
+from ._const import INTERNAL_SOURCE_ID
 from ._events import WorkflowEvent
-from ._shared_state import SharedState
+from ._state import State
+from ._typing_utils import is_instance_of
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
 
+class MessageType(Enum):
+    """Enumeration of WorkflowMessage types in the workflow."""
+
+    STANDARD = "standard"
+    """A standard WorkflowMessage between executors."""
+
+    RESPONSE = "response"
+    """A response WorkflowMessage to a pending request."""
+
+
 @dataclass
-class Message:
-    """A class representing a message in the workflow."""
+class WorkflowMessage:
+    """A class representing a WorkflowMessage in the workflow."""
 
     data: Any
     source_id: str
     target_id: str | None = None
+    type: MessageType = MessageType.STANDARD
 
-    # OpenTelemetry trace context fields for message propagation
+    # OpenTelemetry trace context fields for WorkflowMessage propagation
     # These are plural to support fan-in scenarios where multiple messages are aggregated
     trace_contexts: list[dict[str, str]] | None = None  # W3C Trace Context headers from multiple sources
     source_span_ids: list[str] | None = None  # Publishing span IDs for linking from multiple sources
+
+    # For response messages, the original request data
+    original_request_info_event: WorkflowEvent[Any] | None = None
 
     # Backward compatibility properties
     @property
@@ -42,18 +58,37 @@ class Message:
         """Get the first source span ID for backward compatibility."""
         return self.source_span_ids[0] if self.source_span_ids else None
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the WorkflowMessage to a dictionary for serialization."""
+        return {
+            "data": self.data,
+            "source_id": self.source_id,
+            "target_id": self.target_id,
+            "type": self.type.value,
+            "trace_contexts": self.trace_contexts,
+            "source_span_ids": self.source_span_ids,
+            "original_request_info_event": self.original_request_info_event,
+        }
 
-class WorkflowState(TypedDict):
-    """TypedDict representing the serializable state of a workflow execution.
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> WorkflowMessage:
+        """Create a WorkflowMessage from a dictionary."""
+        # Validation
+        if "data" not in data:
+            raise KeyError("Missing 'data' field in WorkflowMessage dictionary.")
 
-    This includes all state data needed for checkpointing and restoration.
-    """
+        if "source_id" not in data:
+            raise KeyError("Missing 'source_id' field in WorkflowMessage dictionary.")
 
-    messages: dict[str, list[dict[str, Any]]]
-    shared_state: dict[str, Any]
-    executor_states: dict[str, dict[str, Any]]
-    iteration_count: int
-    max_iterations: int
+        return WorkflowMessage(
+            data=data["data"],
+            source_id=data["source_id"],
+            target_id=data.get("target_id"),
+            type=MessageType(data.get("type", "standard")),
+            trace_contexts=data.get("trace_contexts"),
+            source_span_ids=data.get("source_span_ids"),
+            original_request_info_event=data.get("original_request_info_event"),
+        )
 
 
 @runtime_checkable
@@ -64,15 +99,15 @@ class RunnerContext(Protocol):
     If checkpoint storage is not configured, checkpoint methods may raise.
     """
 
-    async def send_message(self, message: Message) -> None:
-        """Send a message from the executor to the context.
+    async def send_message(self, message: WorkflowMessage) -> None:
+        """Send a WorkflowMessage from the executor to the context.
 
         Args:
-            message: The message to be sent.
+            message: The WorkflowMessage to be sent.
         """
         ...
 
-    async def drain_messages(self) -> dict[str, list[Message]]:
+    async def drain_messages(self) -> dict[str, list[WorkflowMessage]]:
         """Drain all messages from the context.
 
         Returns:
@@ -116,26 +151,6 @@ class RunnerContext(Protocol):
         """Wait for and return the next event emitted by the workflow run."""
         ...
 
-    async def set_executor_state(self, executor_id: str, state: dict[str, Any]) -> None:
-        """Set the state for a specific executor.
-
-        Args:
-            executor_id: The ID of the executor whose state is being set.
-            state: The state data to be set for the executor.
-        """
-        ...
-
-    async def get_executor_state(self, executor_id: str) -> dict[str, Any] | None:
-        """Get the state for a specific executor.
-
-        Args:
-            executor_id: The ID of the executor whose state is being retrieved.
-
-        Returns:
-            The state data for the executor, or None if not found.
-        """
-        ...
-
     # Checkpointing capability
     def has_checkpointing(self) -> bool:
         """Check if the context supports checkpointing.
@@ -145,12 +160,19 @@ class RunnerContext(Protocol):
         """
         ...
 
-    # Checkpointing APIs (optional, enabled by storage)
-    def set_workflow_id(self, workflow_id: str) -> None:
-        """Set the workflow ID for the context."""
+    def set_runtime_checkpoint_storage(self, storage: CheckpointStorage) -> None:
+        """Set runtime checkpoint storage to override build-time configuration.
+
+        Args:
+            storage: The checkpoint storage to use for this run.
+        """
         ...
 
-    def reset_for_new_run(self, workflow_shared_state: SharedState | None = None) -> None:
+    def clear_runtime_checkpoint_storage(self) -> None:
+        """Clear runtime checkpoint storage override."""
+        ...
+
+    def reset_for_new_run(self) -> None:
         """Reset the context for a new workflow run."""
         ...
 
@@ -158,7 +180,7 @@ class RunnerContext(Protocol):
         """Set whether agents should stream incremental updates.
 
         Args:
-            streaming: True for streaming mode (run_stream), False for non-streaming (run).
+            streaming: True for streaming mode (stream=True), False for non-streaming (stream=False).
         """
         ...
 
@@ -170,27 +192,74 @@ class RunnerContext(Protocol):
         """
         ...
 
-    async def create_checkpoint(self, metadata: dict[str, Any] | None = None) -> str:
+    async def create_checkpoint(
+        self,
+        workflow_name: str,
+        graph_signature_hash: str,
+        state: State,
+        previous_checkpoint_id: CheckpointID | None,
+        iteration_count: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointID:
         """Create a checkpoint of the current workflow state.
 
         Args:
+            workflow_name: The name of the workflow for which the checkpoint is being created.
+            graph_signature_hash: Hash of the workflow graph topology to
+                validate checkpoint compatibility during restore.
+            state: The state to include in the checkpoint.
+                   This is needed to capture the full state of the workflow.
+                   The state is not managed by the context itself.
+            previous_checkpoint_id: The ID of the previous checkpoint, if any, to form a checkpoint chain.
+            iteration_count: The current iteration count of the workflow.
             metadata: Optional metadata to associate with the checkpoint.
+
+        Returns:
+            The ID of the created checkpoint.
         """
         ...
 
-    async def load_checkpoint(self, checkpoint_id: str) -> WorkflowCheckpoint | None:
-        """Load a checkpoint without mutating the current context state."""
-        ...
-
-    async def get_workflow_state(self) -> WorkflowState:
-        """Get the current state of the workflow suitable for checkpointing."""
-        ...
-
-    async def set_workflow_state(self, state: WorkflowState) -> None:
-        """Set the state of the workflow from a checkpoint.
+    async def load_checkpoint(self, checkpoint_id: CheckpointID) -> WorkflowCheckpoint | None:
+        """Load a checkpoint without mutating the current context state.
 
         Args:
-            state: The state data to set for the workflow.
+            checkpoint_id: The ID of the checkpoint to load.
+
+        Returns:
+            The loaded checkpoint, or None if it does not exist.
+        """
+        ...
+
+    async def apply_checkpoint(self, checkpoint: WorkflowCheckpoint) -> None:
+        """Apply a checkpoint to the current context, mutating its state.
+
+        Args:
+            checkpoint: The checkpoint whose state is to be applied.
+        """
+        ...
+
+    async def add_request_info_event(self, event: WorkflowEvent[Any]) -> None:
+        """Add a request_info event to the context and track it for correlation.
+
+        Args:
+            event: The WorkflowEvent with type='request_info' to be added.
+        """
+        ...
+
+    async def send_request_info_response(self, request_id: str, response: Any) -> None:
+        """Send a response correlated to a pending request.
+
+        Args:
+            request_id: The ID of the original request.
+            response: The response data to be sent.
+        """
+        ...
+
+    async def get_pending_request_info_events(self) -> dict[str, WorkflowEvent[Any]]:
+        """Get the mapping of request IDs to their corresponding request_info events.
+
+        Returns:
+            A dictionary mapping request IDs to their corresponding WorkflowEvent (type='request_info').
         """
         ...
 
@@ -204,26 +273,26 @@ class InProcRunnerContext:
         Args:
             checkpoint_storage: Optional storage to enable checkpointing.
         """
-        self._messages: dict[str, list[Message]] = {}
-        # Event queue for immediate streaming of events (e.g., AgentRunUpdateEvent)
+        self._messages: dict[str, list[WorkflowMessage]] = {}
+        # Event queue for immediate streaming of events
         self._event_queue: asyncio.Queue[WorkflowEvent] = asyncio.Queue()
+
+        # An additional storage for pending request info events
+        self._pending_request_info_events: dict[str, WorkflowEvent[Any]] = {}
 
         # Checkpointing configuration/state
         self._checkpoint_storage = checkpoint_storage
-        self._workflow_id: str | None = None
-        self._shared_state: dict[str, Any] = {}
-        self._executor_states: dict[str, dict[str, Any]] = {}
-        self._iteration_count: int = 0
-        self._max_iterations: int = 100
+        self._runtime_checkpoint_storage: CheckpointStorage | None = None
 
-        # Streaming flag - set by workflow's run_stream() vs run()
+        # Streaming flag - set by workflow's run(..., stream=True) vs run(..., stream=False)
         self._streaming: bool = False
 
-    async def send_message(self, message: Message) -> None:
+    # region Messaging and Events
+    async def send_message(self, message: WorkflowMessage) -> None:
         self._messages.setdefault(message.source_id, [])
         self._messages[message.source_id].append(message)
 
-    async def drain_messages(self) -> dict[str, list[Message]]:
+    async def drain_messages(self) -> dict[str, list[WorkflowMessage]]:
         messages = copy(self._messages)
         self._messages.clear()
         return messages
@@ -259,23 +328,98 @@ class InProcRunnerContext:
         """
         return await self._event_queue.get()
 
-    async def set_executor_state(self, executor_id: str, state: dict[str, Any]) -> None:
-        self._executor_states[executor_id] = state
+    # endregion Messaging and Events
 
-    async def get_executor_state(self, executor_id: str) -> dict[str, Any] | None:
-        return self._executor_states.get(executor_id)
+    # region Checkpointing
+
+    def _get_effective_checkpoint_storage(self) -> CheckpointStorage | None:
+        """Get the effective checkpoint storage (runtime override or build-time)."""
+        return self._runtime_checkpoint_storage or self._checkpoint_storage
+
+    def set_runtime_checkpoint_storage(self, storage: CheckpointStorage) -> None:
+        """Set runtime checkpoint storage to override build-time configuration.
+
+        Args:
+            storage: The checkpoint storage to use for this run.
+        """
+        self._runtime_checkpoint_storage = storage
+
+    def clear_runtime_checkpoint_storage(self) -> None:
+        """Clear runtime checkpoint storage override.
+
+        This is called automatically by workflow execution methods after a run completes,
+        ensuring runtime storage doesn't leak across runs.
+        """
+        self._runtime_checkpoint_storage = None
 
     def has_checkpointing(self) -> bool:
-        return self._checkpoint_storage is not None
+        return self._get_effective_checkpoint_storage() is not None
 
-    def set_workflow_id(self, workflow_id: str) -> None:
-        self._workflow_id = workflow_id
+    async def create_checkpoint(
+        self,
+        workflow_name: str,
+        graph_signature_hash: str,
+        state: State,
+        previous_checkpoint_id: CheckpointID | None,
+        iteration_count: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointID:
+        storage = self._get_effective_checkpoint_storage()
+        if not storage:
+            raise ValueError("Checkpoint storage not configured")
+
+        checkpoint = WorkflowCheckpoint(
+            workflow_name=workflow_name,
+            graph_signature_hash=graph_signature_hash,
+            previous_checkpoint_id=previous_checkpoint_id,
+            messages=dict(self._messages),
+            state=state.export_state(),
+            pending_request_info_events=dict(self._pending_request_info_events),
+            iteration_count=iteration_count,
+            metadata=metadata or {},
+        )
+        checkpoint_id = await storage.save(checkpoint)
+        logger.debug(f"Created checkpoint {checkpoint_id}")
+        return checkpoint_id
+
+    async def load_checkpoint(self, checkpoint_id: CheckpointID) -> WorkflowCheckpoint:
+        storage = self._get_effective_checkpoint_storage()
+        if not storage:
+            raise ValueError("Checkpoint storage not configured")
+        return await storage.load(checkpoint_id)
+
+    def reset_for_new_run(self) -> None:
+        """Reset the context for a new workflow run.
+
+        This clears messages, events, and resets streaming flag.
+        Runtime checkpoint storage is NOT cleared here as it's managed at the workflow level.
+        """
+        self._messages.clear()
+        # Clear any pending events (best-effort) by recreating the queue
+        self._event_queue = asyncio.Queue()
+        self._streaming = False  # Reset streaming flag
+
+    async def apply_checkpoint(self, checkpoint: WorkflowCheckpoint) -> None:
+        """Apply a checkpoint to the current context, mutating its state."""
+        # Restore messages
+        self._messages.clear()
+        messages_data = checkpoint.messages
+        for source_id, message_list in messages_data.items():
+            self._messages[source_id] = list(message_list)
+
+        # Restore pending request info events
+        self._pending_request_info_events.clear()
+        for request_id, request_info_event in checkpoint.pending_request_info_events.items():
+            self._pending_request_info_events[request_id] = request_info_event
+            await self.add_event(request_info_event)
+
+    # endregion Checkpointing
 
     def set_streaming(self, streaming: bool) -> None:
         """Set whether agents should stream incremental updates.
 
         Args:
-            streaming: True for streaming mode (run_stream), False for non-streaming (run).
+            streaming: True for streaming mode (run(stream=True)), False for non-streaming.
         """
         self._streaming = streaming
 
@@ -287,101 +431,52 @@ class InProcRunnerContext:
         """
         return self._streaming
 
-    def reset_for_new_run(self, workflow_shared_state: SharedState | None = None) -> None:
-        self._messages.clear()
-        # Clear any pending events (best-effort) by recreating the queue
-        self._event_queue = asyncio.Queue()
-        self._shared_state.clear()
-        self._executor_states.clear()
-        self._iteration_count = 0
-        self._streaming = False  # Reset streaming flag
-        if workflow_shared_state is not None and hasattr(workflow_shared_state, "_state"):
-            workflow_shared_state._state.clear()  # type: ignore[attr-defined]
+    async def add_request_info_event(self, event: WorkflowEvent[Any]) -> None:
+        """Add a request_info event to the context and track it for correlation.
 
-    async def create_checkpoint(self, metadata: dict[str, Any] | None = None) -> str:
-        if not self._checkpoint_storage:
-            raise ValueError("Checkpoint storage not configured")
+        Args:
+            event: The WorkflowEvent with type='request_info' to be added.
+        """
+        if event.type != "request_info":
+            raise ValueError("Event type must be 'request_info'")
+        self._pending_request_info_events[event.request_id] = event
+        await self.add_event(event)
 
-        wf_id = self._workflow_id or str(uuid.uuid4())
-        self._workflow_id = wf_id
-        state = await self.get_workflow_state()
+    async def send_request_info_response(self, request_id: str, response: Any) -> None:
+        """Send a response correlated to a pending request.
 
-        checkpoint = WorkflowCheckpoint(
-            workflow_id=wf_id,
-            messages=state["messages"],
-            shared_state=state.get("shared_state", {}),
-            executor_states=state.get("executor_states", {}),
-            iteration_count=state.get("iteration_count", 0),
-            max_iterations=state.get("max_iterations", DEFAULT_MAX_ITERATIONS),
-            metadata=metadata or {},
+        Args:
+            request_id: The ID of the original request.
+            response: The response data to be sent.
+        """
+        event = self._pending_request_info_events.pop(request_id, None)
+        if not event:
+            raise ValueError(f"No pending request found for request_id: {request_id}")
+
+        # Validate response type if specified
+        if event.response_type and not is_instance_of(response, event.response_type):
+            raise TypeError(
+                f"Response type mismatch for request_id {request_id}: "
+                f"expected {event.response_type.__name__}, got {type(response).__name__}"
+            )
+
+        source_executor_id = event.source_executor_id
+
+        # Create ResponseMessage instance
+        response_msg = WorkflowMessage(
+            data=response,
+            source_id=INTERNAL_SOURCE_ID(source_executor_id),
+            target_id=source_executor_id,
+            type=MessageType.RESPONSE,
+            original_request_info_event=event,
         )
-        checkpoint_id = await self._checkpoint_storage.save_checkpoint(checkpoint)
-        logger.info(f"Created checkpoint {checkpoint_id} for workflow {wf_id}'")
-        return checkpoint_id
 
-    async def load_checkpoint(self, checkpoint_id: str) -> WorkflowCheckpoint | None:
-        if not self._checkpoint_storage:
-            raise ValueError("Checkpoint storage not configured")
-        return await self._checkpoint_storage.load_checkpoint(checkpoint_id)
+        await self.send_message(response_msg)
 
-    async def get_workflow_state(self) -> WorkflowState:
-        serializable_messages: dict[str, list[dict[str, Any]]] = {}
-        for source_id, message_list in self._messages.items():
-            serializable_messages[source_id] = [
-                {
-                    "data": encode_checkpoint_value(msg.data),
-                    "source_id": msg.source_id,
-                    "target_id": msg.target_id,
-                    "trace_contexts": msg.trace_contexts,
-                    "source_span_ids": msg.source_span_ids,
-                }
-                for msg in message_list
-            ]
+    async def get_pending_request_info_events(self) -> dict[str, WorkflowEvent[Any]]:
+        """Get the mapping of request IDs to their corresponding request_info events.
 
-        return {
-            "messages": serializable_messages,
-            "shared_state": encode_checkpoint_value(self._shared_state),
-            "executor_states": encode_checkpoint_value(self._executor_states),
-            "iteration_count": self._iteration_count,
-            "max_iterations": self._max_iterations,
-        }
-
-    async def set_workflow_state(self, state: WorkflowState) -> None:
-        self._messages.clear()
-        messages_data = state.get("messages", {})
-        for source_id, message_list in messages_data.items():
-            self._messages[source_id] = [
-                Message(
-                    data=decode_checkpoint_value(msg.get("data")),
-                    source_id=msg.get("source_id", ""),
-                    target_id=msg.get("target_id"),
-                    trace_contexts=msg.get("trace_contexts"),
-                    source_span_ids=msg.get("source_span_ids"),
-                )
-                for msg in message_list
-            ]
-        # Restore shared_state
-        decoded_shared_raw = decode_checkpoint_value(state.get("shared_state", {}))
-        if isinstance(decoded_shared_raw, dict):
-            self._shared_state = cast(dict[str, Any], decoded_shared_raw)
-        else:  # fallback to empty dict if corrupted
-            self._shared_state = {}
-
-        # Restore executor_states ensuring value types are dicts
-        decoded_exec_raw = decode_checkpoint_value(state.get("executor_states", {}))
-        if isinstance(decoded_exec_raw, dict):
-            typed_exec: dict[str, dict[str, Any]] = {}
-            for k_raw, v_raw in decoded_exec_raw.items():  # type: ignore[assignment]
-                if isinstance(k_raw, str) and isinstance(v_raw, dict):
-                    # Filter inner dict to string keys only (best-effort)
-                    inner: dict[str, Any] = {}
-                    for inner_k, inner_v in v_raw.items():  # type: ignore[assignment]
-                        if isinstance(inner_k, str):
-                            inner[inner_k] = inner_v
-                    typed_exec[k_raw] = inner
-            self._executor_states = typed_exec
-        else:
-            self._executor_states = {}
-
-        self._iteration_count = state.get("iteration_count", 0)
-        self._max_iterations = state.get("max_iterations", 100)
+        Returns:
+            A dictionary mapping request IDs to their corresponding WorkflowEvent (type='request_info').
+        """
+        return dict(self._pending_request_info_events)

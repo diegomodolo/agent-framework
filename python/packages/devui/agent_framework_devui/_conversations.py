@@ -3,18 +3,23 @@
 """Conversation storage abstraction for OpenAI Conversations API.
 
 This module provides a clean abstraction layer for managing conversations
-while wrapping AgentFramework's AgentThread underneath.
+with in-memory message storage.
 """
+
+from __future__ import annotations
 
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import MutableSequence
 from typing import Any, Literal, cast
 
-from agent_framework import AgentThread, ChatMessage
+from agent_framework import AgentSession, Message
+from agent_framework._workflows._checkpoint import InMemoryCheckpointStorage, WorkflowCheckpoint
 from openai.types.conversations import Conversation, ConversationDeletedResource
 from openai.types.conversations.conversation_item import ConversationItem
-from openai.types.conversations.message import Message
+from openai.types.conversations.message import Content as OpenAIContent
+from openai.types.conversations.message import Message as OpenAIMessage
 from openai.types.conversations.text_content import TextContent
 from openai.types.responses import (
     ResponseFunctionToolCallItem,
@@ -26,23 +31,30 @@ from openai.types.responses import (
 # Type alias for OpenAI Message role literals
 MessageRole = Literal["unknown", "user", "assistant", "system", "critic", "discriminator", "developer", "tool"]
 
+# Checkpoint item type constants
+CONVERSATION_ITEM_TYPE_CHECKPOINT = "checkpoint"
+CONVERSATION_TYPE_CHECKPOINT_CONTAINER = "checkpoint_container"
+
 
 class ConversationStore(ABC):
     """Abstract base class for conversation storage.
 
     Provides OpenAI Conversations API interface while managing
-    AgentThread instances underneath.
+    message storage internally.
     """
 
     @abstractmethod
-    def create_conversation(self, metadata: dict[str, str] | None = None) -> Conversation:
-        """Create a new conversation (wraps AgentThread creation).
+    def create_conversation(
+        self, metadata: dict[str, str] | None = None, conversation_id: str | None = None
+    ) -> Conversation:
+        """Create a new conversation.
 
         Args:
             metadata: Optional metadata dict (e.g., {"agent_id": "weather_agent"})
+            conversation_id: Optional conversation ID (if None, generates one)
 
         Returns:
-            Conversation object with generated ID
+            Conversation object with generated or provided ID
         """
         pass
 
@@ -76,7 +88,7 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def delete_conversation(self, conversation_id: str) -> ConversationDeletedResource:
-        """Delete conversation (including AgentThread).
+        """Delete conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -91,7 +103,7 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def add_items(self, conversation_id: str, items: list[dict[str, Any]]) -> list[ConversationItem]:
-        """Add items to conversation (syncs to AgentThread.message_store).
+        """Add items to conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -109,7 +121,7 @@ class ConversationStore(ABC):
     async def list_items(
         self, conversation_id: str, limit: int = 100, after: str | None = None, order: str = "asc"
     ) -> tuple[list[ConversationItem], bool]:
-        """List conversation items from AgentThread.message_store.
+        """List conversation items.
 
         Args:
             conversation_id: Conversation ID
@@ -126,8 +138,11 @@ class ConversationStore(ABC):
         pass
 
     @abstractmethod
-    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
-        """Get specific conversation item.
+    async def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """Get a specific conversation item by ID.
+
+        Supports checkpoint items - will load full checkpoint state from storage.
+        For checkpoints, the full state is included in metadata.full_checkpoint.
 
         Args:
             conversation_id: Conversation ID
@@ -139,22 +154,22 @@ class ConversationStore(ABC):
         pass
 
     @abstractmethod
-    def get_thread(self, conversation_id: str) -> AgentThread | None:
-        """Get underlying AgentThread for execution (internal use).
+    def get_session(self, conversation_id: str) -> AgentSession | None:
+        """Get AgentSession for agent execution.
 
         This is the critical method that allows the executor to get the
-        AgentThread for running agents with conversation context.
+        AgentSession for running agents with conversation context.
 
         Args:
             conversation_id: Conversation ID
 
         Returns:
-            AgentThread object or None if not found
+            AgentSession object or None if not found
         """
         pass
 
     @abstractmethod
-    def list_conversations_by_metadata(self, metadata_filter: dict[str, str]) -> list[Conversation]:
+    async def list_conversations_by_metadata(self, metadata_filter: dict[str, str]) -> list[Conversation]:
         """Filter conversations by metadata (e.g., agent_id).
 
         Args:
@@ -165,39 +180,73 @@ class ConversationStore(ABC):
         """
         pass
 
+    @abstractmethod
+    def add_trace(self, conversation_id: str, trace_event: dict[str, Any]) -> None:
+        """Add a trace event to the conversation for context inspection.
+
+        Traces capture execution metadata like token usage, timing, and LLM context
+        that is useful for debugging.
+
+        Args:
+            conversation_id: Conversation ID
+            trace_event: Trace event data (from ResponseTraceEvent.data)
+        """
+        pass
+
+    @abstractmethod
+    def get_traces(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Get all trace events for a conversation.
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            List of trace event dicts, or empty list if not found
+        """
+        pass
+
 
 class InMemoryConversationStore(ConversationStore):
-    """In-memory conversation storage wrapping AgentThread.
+    """In-memory conversation storage.
 
     This implementation stores conversations in memory with their
-    underlying AgentThread instances for execution.
+    underlying message lists and AgentSession instances for execution.
     """
 
     def __init__(self) -> None:
         """Initialize in-memory conversation storage.
 
         Storage structure maps conversation IDs to conversation data including
-        the underlying AgentThread, metadata, and cached ConversationItems.
+        messages, metadata, and cached ConversationItems.
         """
         self._conversations: dict[str, dict[str, Any]] = {}
 
         # Item index for O(1) lookup: {conversation_id: {item_id: ConversationItem}}
         self._item_index: dict[str, dict[str, ConversationItem]] = {}
 
-    def create_conversation(self, metadata: dict[str, str] | None = None) -> Conversation:
-        """Create a new conversation with underlying AgentThread."""
-        conv_id = f"conv_{uuid.uuid4().hex}"
+    def create_conversation(
+        self, metadata: dict[str, str] | None = None, conversation_id: str | None = None
+    ) -> Conversation:
+        """Create a new conversation with message storage and checkpoint storage."""
+        conv_id = conversation_id or f"conv_{uuid.uuid4().hex}"
         created_at = int(time.time())
 
-        # Create AgentThread with default ChatMessageStore
-        thread = AgentThread()
+        # Create message list for internal storage and AgentSession for execution
+        messages: list[Message] = []
+        session = AgentSession(session_id=conv_id)
+
+        # Create session-scoped checkpoint storage (one per conversation)
+        checkpoint_storage = InMemoryCheckpointStorage()
 
         self._conversations[conv_id] = {
             "id": conv_id,
-            "thread": thread,
+            "messages": messages,
+            "session": session,
+            "checkpoint_storage": checkpoint_storage,
             "metadata": metadata or {},
             "created_at": created_at,
             "items": [],
+            "traces": [],  # Trace events for context inspection (token usage, timing, etc.)
         }
 
         # Initialize item index for this conversation
@@ -234,7 +283,7 @@ class InMemoryConversationStore(ConversationStore):
         )
 
     def delete_conversation(self, conversation_id: str) -> ConversationDeletedResource:
-        """Delete conversation and its AgentThread."""
+        """Delete conversation."""
         if conversation_id not in self._conversations:
             raise ValueError(f"Conversation {conversation_id} not found")
 
@@ -245,49 +294,49 @@ class InMemoryConversationStore(ConversationStore):
         return ConversationDeletedResource(id=conversation_id, object="conversation.deleted", deleted=True)
 
     async def add_items(self, conversation_id: str, items: list[dict[str, Any]]) -> list[ConversationItem]:
-        """Add items to conversation and sync to AgentThread."""
+        """Add items to conversation."""
         conv_data = self._conversations.get(conversation_id)
         if not conv_data:
             raise ValueError(f"Conversation {conversation_id} not found")
 
-        thread: AgentThread = conv_data["thread"]
+        stored_messages: list[Message] = conv_data["messages"]
 
-        # Convert items to ChatMessages and add to thread
-        chat_messages = []
+        # Convert items to Messages and add to storage
+        chat_messages: list[Message] = []
         for item in items:
             # Simple conversion - assume text content for now
             role = item.get("role", "user")
             content = item.get("content", [])
-            text = content[0].get("text", "") if content else ""
+            first_content = cast(
+                dict[str, Any],
+                content[0] if content and isinstance(content, list) and isinstance(content[0], dict) else {},
+            )
+            text_obj = first_content.get("text", "")
+            text = text_obj if isinstance(text_obj, str) else str(text_obj)
 
-            chat_msg = ChatMessage(role=role, contents=[{"type": "text", "text": text}])
+            chat_msg = Message(role=role, text=text)  # type: ignore[arg-type]
             chat_messages.append(chat_msg)
 
-        # Add messages to AgentThread
-        await thread.on_new_messages(chat_messages)
+        # Add messages to internal storage
+        stored_messages.extend(chat_messages)
 
         # Create Message objects (ConversationItem is a Union - use concrete Message type)
         conv_items: list[ConversationItem] = []
         for msg in chat_messages:
             item_id = f"item_{uuid.uuid4().hex}"
 
-            # Extract role - handle both string and enum
-            role_str = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
-            role = cast(MessageRole, role_str)  # Safe: Agent Framework roles match OpenAI roles
-
-            # Convert ChatMessage contents to OpenAI TextContent format
-            message_content = []
+            # Convert Message contents to OpenAI TextContent format
+            message_content: MutableSequence[OpenAIContent] = []
             for content_item in msg.contents:
-                if hasattr(content_item, "type") and content_item.type == "text":
+                if content_item.type == "text":
                     # Extract text from TextContent object
-                    text_value = getattr(content_item, "text", "")
-                    message_content.append(TextContent(type="text", text=text_value))
+                    message_content.append(TextContent(type="text", text=content_item.text or ""))
 
             # Create Message object (concrete type from ConversationItem union)
-            message = Message(
+            message = OpenAIMessage(
                 id=item_id,
                 type="message",  # Required discriminator for union
-                role=role,
+                role=cast(MessageRole, msg.role),  # Safe: Agent Framework roles match OpenAI roles,
                 content=message_content,
                 status="completed",  # Required field
             )
@@ -309,9 +358,9 @@ class InMemoryConversationStore(ConversationStore):
     async def list_items(
         self, conversation_id: str, limit: int = 100, after: str | None = None, order: str = "asc"
     ) -> tuple[list[ConversationItem], bool]:
-        """List conversation items from AgentThread message store.
+        """List conversation items.
 
-        Converts AgentFramework ChatMessages to proper OpenAI ConversationItem types:
+        Converts stored Messages to proper OpenAI ConversationItem types:
         - Messages with text/images/files → Message
         - Function calls → ResponseFunctionToolCallItem
         - Function results → ResponseFunctionToolCallOutputItem
@@ -320,109 +369,151 @@ class InMemoryConversationStore(ConversationStore):
         if not conv_data:
             raise ValueError(f"Conversation {conversation_id} not found")
 
-        thread: AgentThread = conv_data["thread"]
+        stored_messages: list[Message] = conv_data["messages"]
 
-        # Get messages from thread's message store
+        # Convert stored messages to ConversationItem types
         items: list[ConversationItem] = []
-        if thread.message_store:
-            af_messages = await thread.message_store.list_messages()
+        af_messages = stored_messages
 
-            # Convert each AgentFramework ChatMessage to appropriate ConversationItem type(s)
-            for i, msg in enumerate(af_messages):
-                item_id = f"item_{i}"
-                role_str = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
-                role = cast(MessageRole, role_str)  # Safe: Agent Framework roles match OpenAI roles
+        # Convert each AgentFramework Message to appropriate ConversationItem type(s)
+        for i, msg in enumerate(af_messages):
+            item_id = f"item_{i}"
+            role_str = msg.role if hasattr(msg.role, "value") else str(msg.role)
+            role = cast(MessageRole, role_str)  # Safe: Agent Framework roles match OpenAI roles
 
-                # Process each content item in the message
-                # A single ChatMessage may produce multiple ConversationItems
-                # (e.g., a message with both text and a function call)
-                message_contents: list[TextContent | ResponseInputImage | ResponseInputFile] = []
-                function_calls = []
-                function_results = []
+            # Process each content item in the message
+            # A single Message may produce multiple ConversationItems
+            # (e.g., a message with both text and a function call)
+            message_contents: list[TextContent | ResponseInputImage | ResponseInputFile] = []
+            function_calls: list[ResponseFunctionToolCallItem] = []
+            function_results: list[ResponseFunctionToolCallOutputItem] = []
 
-                for content in msg.contents:
-                    content_type = getattr(content, "type", None)
+            for content in msg.contents:
+                content_type = getattr(content, "type", None)
 
-                    if content_type == "text":
-                        # Text content for Message
-                        text_value = getattr(content, "text", "")
-                        message_contents.append(TextContent(type="text", text=text_value))
+                if content_type == "text":
+                    # Text content for Message
+                    text_value = getattr(content, "text", "")
+                    message_contents.append(TextContent(type="text", text=text_value))
 
-                    elif content_type == "data":
-                        # Data content (images, files, PDFs)
-                        uri = getattr(content, "uri", "")
-                        media_type = getattr(content, "media_type", None)
+                elif content_type == "data":
+                    # Data content (images, files, PDFs)
+                    uri = getattr(content, "uri", "")
+                    media_type = getattr(content, "media_type", None)
 
-                        if media_type and media_type.startswith("image/"):
-                            # Convert to ResponseInputImage
-                            message_contents.append(
-                                ResponseInputImage(type="input_image", image_url=uri, detail="auto")
+                    if media_type and media_type.startswith("image/"):
+                        # Convert to ResponseInputImage
+                        message_contents.append(ResponseInputImage(type="input_image", image_url=uri, detail="auto"))
+                    else:
+                        # Convert to ResponseInputFile
+                        # Extract filename from URI if possible
+                        filename = None
+                        if media_type == "application/pdf":
+                            filename = "document.pdf"
+
+                        message_contents.append(ResponseInputFile(type="input_file", file_url=uri, filename=filename))
+
+                elif content_type == "function_call":
+                    # Function call - create separate ConversationItem
+                    call_id = getattr(content, "call_id", None)
+                    name = getattr(content, "name", "")
+                    arguments = getattr(content, "arguments", "")
+
+                    if call_id and name:
+                        function_calls.append(
+                            ResponseFunctionToolCallItem(
+                                id=f"{item_id}_call_{call_id}",
+                                call_id=call_id,
+                                name=name,
+                                arguments=arguments,
+                                type="function_call",
+                                status="completed",
                             )
-                        else:
-                            # Convert to ResponseInputFile
-                            # Extract filename from URI if possible
-                            filename = None
-                            if media_type == "application/pdf":
-                                filename = "document.pdf"
+                        )
 
-                            message_contents.append(
-                                ResponseInputFile(type="input_file", file_url=uri, filename=filename)
-                            )
-
-                    elif content_type == "function_call":
-                        # Function call - create separate ConversationItem
-                        call_id = getattr(content, "call_id", None)
-                        name = getattr(content, "name", "")
-                        arguments = getattr(content, "arguments", "")
-
-                        if call_id and name:
-                            function_calls.append(
-                                ResponseFunctionToolCallItem(
-                                    id=f"{item_id}_call_{call_id}",
-                                    call_id=call_id,
-                                    name=name,
-                                    arguments=arguments,
-                                    type="function_call",
-                                    status="completed",
-                                )
-                            )
-
-                    elif content_type == "function_result":
-                        # Function result - create separate ConversationItem
-                        call_id = getattr(content, "call_id", None)
-                        # Output is stored in additional_properties
+                elif content_type == "function_result":
+                    # Function result - create separate ConversationItem
+                    call_id = getattr(content, "call_id", None)
+                    # Output is stored in the 'result' field of FunctionResultContent
+                    result_value = getattr(content, "result", None)
+                    # Convert result to string (it could be dict, list, or other types)
+                    if result_value is None:
                         output = ""
-                        if hasattr(content, "additional_properties"):
-                            output = content.additional_properties.get("output", "")
+                    elif isinstance(result_value, str):
+                        output = result_value
+                    else:
+                        import json
 
-                        if call_id:
-                            function_results.append(
-                                ResponseFunctionToolCallOutputItem(
-                                    id=f"{item_id}_result_{call_id}",
-                                    call_id=call_id,
-                                    output=output,
-                                    type="function_call_output",
-                                    status="completed",
-                                )
+                        try:
+                            output = json.dumps(result_value)
+                        except (TypeError, ValueError):
+                            output = str(result_value)
+
+                    if call_id:
+                        function_results.append(
+                            ResponseFunctionToolCallOutputItem(
+                                id=f"{item_id}_result_{call_id}",
+                                call_id=call_id,
+                                output=output,
+                                type="function_call_output",
+                                status="completed",
                             )
+                        )
 
-                # Create ConversationItems based on what we found
-                # If message has text/images/files, create a Message item
-                if message_contents:
-                    message = Message(
-                        id=item_id,
-                        type="message",
-                        role=role,  # type: ignore
-                        content=message_contents,  # type: ignore
-                        status="completed",
-                    )
-                    items.append(message)
+            # Create ConversationItems based on what we found
+            # If message has text/images/files, create a Message item
+            if message_contents:
+                message = OpenAIMessage(
+                    id=item_id,
+                    type="message",
+                    role=role,  # type: ignore
+                    content=message_contents,  # type: ignore
+                    status="completed",
+                )
+                items.append(message)
 
-                # Add function call items
-                items.extend(function_calls)
+            # Add function call items
+            items.extend(function_calls)
 
-                # Add function result items
-                items.extend(function_results)
+            # Add function result items
+            items.extend(function_results)
+
+        # Include checkpoints from checkpoint storage as conversation items
+        checkpoint_storage = conv_data.get("checkpoint_storage")
+        if checkpoint_storage:
+            # Get all checkpoints for this conversation
+            checkpoints = self._list_all_checkpoints(checkpoint_storage)
+            for checkpoint in checkpoints:
+                # Create a conversation item for each checkpoint with summary metadata
+                # Full checkpoint state is NOT included here (too large for list view)
+                # Use get_item() to retrieve full checkpoint details
+                # Calculate approximate size of checkpoint
+                import json
+
+                checkpoint_json = json.dumps(checkpoint.to_dict())
+                checkpoint_size = len(checkpoint_json.encode("utf-8"))
+
+                checkpoint_item = {
+                    "id": f"checkpoint_{checkpoint.checkpoint_id}",
+                    "type": "checkpoint",
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    # Keep workflow_id for backward compatibility with existing UI payloads.
+                    "workflow_id": checkpoint.workflow_name,
+                    "workflow_name": checkpoint.workflow_name,
+                    "timestamp": checkpoint.timestamp,
+                    "status": "completed",
+                    "metadata": {
+                        # Summary metrics for list view
+                        "iteration_count": checkpoint.iteration_count,
+                        "pending_hil_count": len(checkpoint.pending_request_info_events),
+                        "has_pending_hil": len(checkpoint.pending_request_info_events) > 0,
+                        "message_count": sum(len(msgs) for msgs in checkpoint.messages.values()),
+                        "size_bytes": checkpoint_size,
+                        "version": checkpoint.version,
+                        "graph_signature_hash": checkpoint.graph_signature_hash,
+                    },
+                }
+                items.append(cast(ConversationItem, checkpoint_item))
 
         # Apply pagination
         if order == "desc":
@@ -441,27 +532,123 @@ class InMemoryConversationStore(ConversationStore):
 
         return paginated_items, has_more
 
-    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
-        """Get specific conversation item - O(1) lookup via index."""
-        # Use index for O(1) lookup instead of linear search
-        conv_items = self._item_index.get(conversation_id)
-        if not conv_items:
-            return None
+    async def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """Get a specific conversation item by ID.
 
-        return conv_items.get(item_id)
+        Supports checkpoint items - will load full checkpoint state from storage.
+        For checkpoints, the full state is included in metadata.full_checkpoint.
+        """
+        # First check item index for messages, function calls, etc. (O(1) lookup)
+        conv_items = self._item_index.get(conversation_id, {})
+        item = conv_items.get(item_id)
+        if item:
+            return item
 
-    def get_thread(self, conversation_id: str) -> AgentThread | None:
-        """Get AgentThread for execution - CRITICAL for agent.run_stream()."""
+        # If not found and ID is a checkpoint, load from checkpoint storage
+        if item_id.startswith("checkpoint_"):
+            checkpoint_id = item_id[len("checkpoint_") :]  # Remove "checkpoint_" prefix
+            conv_data = self._conversations.get(conversation_id)
+            if not conv_data:
+                return None
+
+            checkpoint_storage = conv_data.get("checkpoint_storage")
+            if not checkpoint_storage:
+                return None
+
+            # Load full checkpoint from storage
+            try:
+                checkpoint = await checkpoint_storage.load(checkpoint_id)
+            except Exception:
+                return None
+
+            # Calculate size of checkpoint
+            import json
+
+            checkpoint_json = json.dumps(checkpoint.to_dict())
+            checkpoint_size = len(checkpoint_json.encode("utf-8"))
+
+            # Build checkpoint item with FULL state in metadata
+            checkpoint_item = {
+                "id": item_id,
+                "type": "checkpoint",
+                "checkpoint_id": checkpoint.checkpoint_id,
+                # Keep workflow_id for backward compatibility with existing UI payloads.
+                "workflow_id": checkpoint.workflow_name,
+                "workflow_name": checkpoint.workflow_name,
+                "timestamp": checkpoint.timestamp,
+                "status": "completed",
+                "metadata": {
+                    # Summary metrics (same as list view)
+                    "iteration_count": checkpoint.iteration_count,
+                    "pending_hil_count": len(checkpoint.pending_request_info_events),
+                    "has_pending_hil": len(checkpoint.pending_request_info_events) > 0,
+                    "message_count": sum(len(msgs) for msgs in checkpoint.messages.values()),
+                    "size_bytes": checkpoint_size,
+                    "version": checkpoint.version,
+                    "graph_signature_hash": checkpoint.graph_signature_hash,
+                    # 🔥 FULL checkpoint state (lazy loaded)
+                    "full_checkpoint": checkpoint.to_dict(),
+                },
+            }
+
+            return cast(ConversationItem, checkpoint_item)
+
+        return None
+
+    def get_session(self, conversation_id: str) -> AgentSession | None:
+        """Get AgentSession for execution - CRITICAL for agent.run()."""
         conv_data = self._conversations.get(conversation_id)
-        return conv_data["thread"] if conv_data else None
+        return conv_data["session"] if conv_data else None
 
-    def list_conversations_by_metadata(self, metadata_filter: dict[str, str]) -> list[Conversation]:
+    def add_trace(self, conversation_id: str, trace_event: dict[str, Any]) -> None:
+        """Add a trace event to the conversation for context inspection.
+
+        Traces capture execution metadata like token usage, timing, and LLM context
+        that is useful for debugging.
+
+        Args:
+            conversation_id: Conversation ID
+            trace_event: Trace event data (from ResponseTraceEvent.data)
+        """
+        conv_data = self._conversations.get(conversation_id)
+        if conv_data:
+            traces = conv_data.get("traces", [])
+            traces.append(trace_event)
+            conv_data["traces"] = traces
+
+    def get_traces(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Get all trace events for a conversation.
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            List of trace event dicts, or empty list if not found
+        """
+        conv_data = self._conversations.get(conversation_id)
+        return conv_data.get("traces", []) if conv_data else []
+
+    async def list_conversations_by_metadata(self, metadata_filter: dict[str, str]) -> list[Conversation]:
         """Filter conversations by metadata (e.g., agent_id)."""
-        results = []
+        results: list[Conversation] = []
         for conv_data in self._conversations.values():
-            conv_meta = conv_data.get("metadata", {})
+            conv_meta = conv_data.get("metadata", {}).copy()  # Copy to avoid mutating original
+
             # Check if all filter items match
             if all(conv_meta.get(k) == v for k, v in metadata_filter.items()):
+                # Enrich workflow sessions with checkpoint summary
+                if conv_meta.get("type") == "workflow_session":
+                    checkpoint_storage = conv_data.get("checkpoint_storage")
+                    if checkpoint_storage:
+                        checkpoints = self._list_all_checkpoints(checkpoint_storage)
+                        latest = max(checkpoints, key=lambda cp: cp.timestamp) if checkpoints else None
+                        conv_meta["checkpoint_summary"] = {
+                            "count": len(checkpoints),
+                            "latest_iteration": latest.iteration_count if latest else 0,
+                            "has_pending_hil": len(latest.pending_request_info_events) > 0 if latest else False,
+                            "pending_hil_count": len(latest.pending_request_info_events) if latest else 0,
+                        }
+
                 results.append(
                     Conversation(
                         id=conv_data["id"],
@@ -470,4 +657,61 @@ class InMemoryConversationStore(ConversationStore):
                         metadata=conv_meta,
                     )
                 )
+
+        # Sort by created_at descending (most recent first)
+        results.sort(key=lambda c: c.created_at, reverse=True)
+
         return results
+
+    @staticmethod
+    def _list_all_checkpoints(checkpoint_storage: Any) -> list[WorkflowCheckpoint]:
+        """Return all checkpoints from a conversation-scoped storage instance.
+
+        DevUI uses one checkpoint storage per conversation. Core storage APIs now
+        require workflow_name filters, so we gather directly from in-memory storage
+        internals to provide conversation-wide listing for UI views.
+        """
+        checkpoint_map = getattr(checkpoint_storage, "_checkpoints", None)
+        if isinstance(checkpoint_map, dict):
+            return list(cast(dict[str, WorkflowCheckpoint], checkpoint_map).values())
+        return []
+
+
+class CheckpointConversationManager:
+    """Manages checkpoint storage for workflow sessions - SESSION-SCOPED.
+
+    Simplified architecture: Each conversation has its own InMemoryCheckpointStorage
+    stored in conv_data["checkpoint_storage"]. This manager just retrieves it.
+    Session isolation comes from each conversation having a separate storage instance.
+    """
+
+    def __init__(self, conversation_store: ConversationStore):
+        # Runtime validation since we need specific implementation details
+        if not isinstance(conversation_store, InMemoryConversationStore):
+            raise TypeError("CheckpointConversationManager currently requires InMemoryConversationStore")
+        self._store: InMemoryConversationStore = conversation_store
+        # Keep public reference for backward compatibility with tests
+        self.conversation_store = conversation_store
+
+    def get_checkpoint_storage(self, conversation_id: str) -> InMemoryCheckpointStorage:
+        """Get the checkpoint storage for a specific conversation.
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            InMemoryCheckpointStorage instance for this conversation
+
+        Raises:
+            ValueError: If conversation not found
+        """
+        # Access internal conversations dict (we know it's InMemoryConversationStore)
+        conversations_dict = cast(dict[str, dict[str, Any]], getattr(self._store, "_conversations", {}))
+        conv_data = conversations_dict.get(conversation_id)
+        if not conv_data:
+            raise ValueError(f"Conversation {conversation_id} not found")
+
+        checkpoint_storage = conv_data["checkpoint_storage"]
+        if not isinstance(checkpoint_storage, InMemoryCheckpointStorage):
+            raise TypeError(f"Expected InMemoryCheckpointStorage but got {type(checkpoint_storage)}")
+        return checkpoint_storage

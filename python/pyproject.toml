@@ -4,7 +4,7 @@ description = "Microsoft Agent Framework for building AI Agents with Python. Thi
 authors = [{ name = "Microsoft", email = "af-support@microsoft.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
-version = "1.0.0b251016"
+version = "1.0.0rc3"
 license-files = ["LICENSE"]
 urls.homepage = "https://aka.ms/agent-framework"
 urls.source = "https://github.com/microsoft/agent-framework/tree/main/python"
@@ -19,29 +19,21 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Typing :: Typed",
 ]
 dependencies = [
-    "agent-framework-core",
-    "agent-framework-a2a",
-    "agent-framework-azure-ai",
-    "agent-framework-copilotstudio",
-    "agent-framework-mem0",
-    "agent-framework-redis",
-    "agent-framework-devui",
-    "agent-framework-purview",
+    "agent-framework-core[all]==1.0.0rc3",
 ]
 
 [dependency-groups]
 dev = [
-    "uv>=0.8.2,<0.10.0",
+    "uv>=0.9,<1.0.0",
     "flit>=3.12.0",
-    "pre-commit >= 3.7",
     "ruff>=0.11.8",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.2.1",
-    "pytest-env>=1.1.5",
     "pytest-xdist[psutil]>=3.8.0",
     "pytest-timeout>=2.3.1",
     "pytest-retry>=1",
@@ -51,13 +43,7 @@ dev = [
     "poethepoet>=0.36.0",
     "rich",
     "tomli",
-    "tomli-w",
-]
-docs = [
-    # Documentation
-    "debugpy>=1.8.16",
-    "py2docfx>=0.1.22.dev2259826",
-    "pip",
+    "prek>=0.3.2",
 ]
 
 [tool.uv]
@@ -68,6 +54,18 @@ environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'win32'"
 ]
+override-dependencies = [
+  # A conflict between the dependency of litellm[proxy] < 0.30.0, which is a dependency of agent-lightning
+  # and uvicorn >= 0.34.0, which is a dependency of tau2
+  "uvicorn==0.38.0",
+  # Similar problem with websockets, which is a dependency conflict between litellm[proxy] and mcp
+  "websockets==15.0.1",
+  # grpcio 1.67.x has no Python 3.14 wheels; grpcio 1.76.0+ supports Python 3.14
+  # litellm constrains grpcio<1.68.0 due to resource exhaustion bug (https://github.com/grpc/grpc/issues/38290)
+  # Use version-specific overrides to satisfy both constraints
+  "grpcio>=1.76.0; python_version >= '3.14'",
+  "grpcio>=1.62.3,<1.68.0; python_version < '3.14'",
+]
 
 [tool.uv.workspace]
 members = [ "packages/*" ]
@@ -76,20 +74,34 @@ members = [ "packages/*" ]
 agent-framework = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-a2a = { workspace = true }
+agent-framework-ag-ui = { workspace = true }
+agent-framework-azure-ai-search = { workspace = true }
+agent-framework-azure-cosmos = { workspace = true }
+agent-framework-anthropic = { workspace = true }
 agent-framework-azure-ai = { workspace = true }
+agent-framework-azurefunctions = { workspace = true }
+agent-framework-bedrock = { workspace = true }
+agent-framework-chatkit = { workspace = true }
 agent-framework-copilotstudio = { workspace = true }
+agent-framework-declarative = { workspace = true }
+agent-framework-devui = { workspace = true }
+agent-framework-durabletask = { workspace = true }
+agent-framework-foundry-local = { workspace = true }
 agent-framework-lab = { workspace = true }
 agent-framework-mem0 = { workspace = true }
-agent-framework-redis = { workspace = true }
-agent-framework-devui = { workspace = true }
+agent-framework-ollama = { workspace = true }
 agent-framework-purview = { workspace = true }
+agent-framework-redis = { workspace = true }
+agent-framework-github-copilot = { workspace = true }
+agent-framework-claude = { workspace = true }
+agent-framework-orchestrations = { workspace = true }
 
 [tool.ruff]
 line-length = 120
 target-version = "py310"
 fix = true
 include = ["*.py", "*.pyi", "**/pyproject.toml", "*.ipynb"]
-exclude = ["docs/*", "run_tasks_in_packages_if_exists.py", "check_md_code_blocks.py"]
+exclude = ["scripts"]
 extend-exclude = [
     "[{][{]cookiecutter.package_name[}][}]",
 ]
@@ -127,14 +139,18 @@ ignore = [
     "D418", # allow overload to have a docstring
     "TD003", # allow missing link to todo issue
     "FIX002", # allow todo
-    "B027" # allow empty non-abstract method in ABC
+    "B027", # allow empty non-abstract method in ABC
+    "B905", # `zip()` without an explicit `strict=` parameter
+    "RUF067", # allow version detection in __init__.py
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests` and `samples`.
 "**/tests/**" = ["D", "INP", "TD", "ERA001", "RUF", "S"]
-"samples/**" = ["D", "INP", "ERA001", "RUF", "S", "T201"]
+"samples/**" = ["D", "INP", "ERA001", "RUF", "S", "T201", "CPY"]
 "*.ipynb" = ["CPY", "E501"]
+# RUF070: Assignment before yield is intentional - context manager must exit before yielding
+"**/agent_framework/_workflows/_workflow.py" = ["RUF070"]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -147,17 +163,18 @@ notice-rgx = "^# Copyright \\(c\\) Microsoft\\. All rights reserved\\."
 min-file-size = 1
 
 [tool.pytest.ini_options]
-testpaths = 'packages/**/tests'
+testpaths = ['packages/**/tests', 'packages/**/ag_ui_tests']
 norecursedirs = '**/lab/**'
 addopts = "-ra -q -r fEX"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = []
-timeout = 120
+timeout = 60
 markers = [
     "azure: marks tests as Azure provider specific",
     "azure-ai: marks tests as Azure AI provider specific",
     "openai: marks tests as OpenAI provider specific",
+    "integration: marks tests as integration tests that require external services",
 ]
 
 [tool.coverage.run]
@@ -166,15 +183,11 @@ omit = [
 ]
 
 [tool.pyright]
-include = ["agent_framework", "samples"]
-exclude = ["**/tests/**", "docs", "**/.venv/**", "samples/semantic-kernel-migration/**"]
+exclude = ["**/tests/**", "**/.venv/**", "packages/devui/frontend/**"]
 typeCheckingMode = "strict"
 reportUnnecessaryIsInstance = false
 reportMissingTypeStubs = false
-
-[[tool.pyright.executionEnvironments]]
-root = "samples/semantic-kernel-migration"
-typeCheckingMode = "off"
+reportUnnecessaryCast = "error"
 
 [tool.mypy]
 plugins = ['pydantic.mypy']
@@ -192,120 +205,151 @@ disallow_untyped_decorators = true
 
 [tool.bandit]
 targets = ["agent_framework"]
-exclude_dirs = ["tests", "./run_tasks_in_packages_if_exists.py", "./check_md_code_blocks.py", "docs", "samples"]
+exclude_dirs = ["tests", "scripts", "samples"]
 
 [tool.poe]
 executor.type = "uv"
 
 [tool.poe.tasks]
-markdown-code-lint = """uv run python check_md_code_blocks.py README.md ./packages/**/README.md ./samples/**/*.md --exclude cookiecutter-agent-framework-lab --exclude tau2"""
-samples-code-check = """pyright ./samples"""
-docs-install = "uv sync --all-packages --all-extras --dev -U --prerelease=if-necessary-or-explicit --group=docs"
-docs-clean = "rm -rf docs/build"
-docs-build = "uv run python ./docs/generate_docs.py"
-docs-debug = "uv run python -m debugpy --listen 5678 ./docs/generate_docs.py"
-docs-rename = "mv docs/build/agent-framework-core docs/build/agent-framework"
-pre-commit-install = "uv run pre-commit install --install-hooks --overwrite"
-install = "uv sync --all-packages --all-extras --dev -U --prerelease=if-necessary-or-explicit --no-group=docs"
-test = "python run_tasks_in_packages_if_exists.py test"
-fmt = "python run_tasks_in_packages_if_exists.py fmt"
+markdown-code-lint = "uv run python scripts/check_md_code_blocks.py 'README.md' './packages/**/README.md' './samples/**/*.md' --exclude cookiecutter-agent-framework-lab --exclude tau2 --exclude 'packages/devui/frontend' --exclude context_providers/azure_ai_search"
+prek-install = "prek install --overwrite"
+install = "uv sync --all-packages --all-extras --dev -U --prerelease=if-necessary-or-explicit"
+test = "python scripts/run_tasks_in_packages_if_exists.py test"
+fmt = "python scripts/run_tasks_in_packages_if_exists.py fmt"
 format.ref = "fmt"
-lint = "python run_tasks_in_packages_if_exists.py lint"
-pyright = "python run_tasks_in_packages_if_exists.py pyright"
-mypy = "python run_tasks_in_packages_if_exists.py mypy"
+lint = "python scripts/run_tasks_in_packages_if_exists.py lint"
+samples-lint = "ruff check samples --fix --exclude samples/autogen-migration,samples/semantic-kernel-migration --ignore E501,ASYNC,B901,TD002"
+pyright = "python scripts/run_tasks_in_packages_if_exists.py pyright"
+mypy = "python scripts/run_tasks_in_packages_if_exists.py mypy"
+samples-syntax = "pyright -p pyrightconfig.samples.json --warnings"
+typing = ["pyright", "mypy"]
 # cleaning
-clean-dist-packages = "python run_tasks_in_packages_if_exists.py clean-dist"
+clean-dist-packages = "python scripts/run_tasks_in_packages_if_exists.py clean-dist"
 clean-dist-meta = "rm -rf dist"
 clean-dist = ["clean-dist-packages", "clean-dist-meta"]
 # build and publish
-build-packages = "python run_tasks_in_packages_if_exists.py build"
+build-packages = "python scripts/run_tasks_in_packages_if_exists.py build"
 build-meta = "python -m flit build"
 build = ["build-packages", "build-meta"]
 publish = "uv publish"
 # combined checks
-check = ["fmt", "lint", "pyright", "mypy", "test", "markdown-code-lint", "samples-code-check"]
-pre-commit-check = ["fmt", "lint", "pyright", "markdown-code-lint", "samples-code-check"]
+check-packages = "python scripts/run_tasks_in_packages_if_exists.py fmt lint pyright"
+check = ["check-packages", "samples-lint", "samples-syntax", "test", "markdown-code-lint"]
 
 [tool.poe.tasks.all-tests-cov]
 cmd = """
 pytest --import-mode=importlib
+-m "not integration"
 --cov=agent_framework
+--cov=agent_framework_core
 --cov=agent_framework_a2a
+--cov=agent_framework_ag_ui
+--cov=agent_framework_anthropic
 --cov=agent_framework_azure_ai
+--cov=agent_framework_azure_ai_search
+--cov=agent_framework_azurefunctions
+--cov=agent_framework_chatkit
 --cov=agent_framework_copilotstudio
 --cov=agent_framework_mem0
---cov=agent_framework_redis
 --cov=agent_framework_purview
+--cov=agent_framework_redis
+--cov=agent_framework_orchestrations
+--cov=agent_framework_declarative
+--cov-config=pyproject.toml
 --cov-report=term-missing:skip-covered
 --ignore-glob=packages/lab/**
 --ignore-glob=packages/devui/**
--n logical --dist loadfile --dist worksteal
-packages/**/tests
+-rs
+-n logical --dist worksteal
+    packages/**/tests
 """
 
 [tool.poe.tasks.all-tests]
 cmd = """
 pytest --import-mode=importlib
+-m "not integration"
 --ignore-glob=packages/lab/**
 --ignore-glob=packages/devui/**
--n logical --dist loadfile --dist worksteal
-packages/**/tests
-"""
-
-[tool.poe.tasks.azure-ai-tests]
-cmd = """
-pytest --import-mode=importlib
--n logical --dist loadfile --dist worksteal
-packages/azure-ai/tests
+-rs
+-n logical --dist worksteal
+    packages/**/tests
 """
 
 [tool.poe.tasks.venv]
 cmd = "uv venv --clear --python $python"
 args = [{ name = "python", default = "3.13", options = ['-p', '--python'] }]
+
 [tool.poe.tasks.setup]
 sequence = [
     { ref = "venv --python $python"},
     { ref = "install" },
-    { ref = "pre-commit-install" }
+    { ref = "prek-install" }
 ]
 args = [{ name = "python", default = "3.13", options = ['-p', '--python'] }]
-[tool.poe.tasks.docs-full]
+
+[tool.poe.tasks.prek-pyright]
+cmd = "uv run python scripts/run_tasks_in_changed_packages.py pyright --files ${files}"
+args = [{ name = "files", default = ".", positional = true, multiple = true }]
+
+[tool.poe.tasks.prek-check-packages]
+cmd = "uv run python scripts/run_tasks_in_changed_packages.py fmt lint pyright --files ${files}"
+args = [{ name = "files", default = ".", positional = true, multiple = true }]
+
+[tool.poe.tasks.prek-markdown-code-lint]
+cmd = """uv run python scripts/check_md_code_blocks.py ${files} --no-glob
+    --exclude cookiecutter-agent-framework-lab --exclude tau2
+    --exclude packages/devui/frontend --exclude context_providers/azure_ai_search"""
+args = [{ name = "files", default = ".", positional = true, multiple = true }]
+
+[tool.poe.tasks.prek-samples-check]
+shell = """
+HAS_SAMPLES=false
+for f in ${files}; do
+    case "$f" in
+        samples/*) HAS_SAMPLES=true; break ;;
+    esac
+done
+if [ "$HAS_SAMPLES" = true ]; then
+    echo "Sample files changed, running samples checks..."
+    uv run ruff check samples --fix --exclude samples/autogen-migration,samples/semantic-kernel-migration --ignore E501,ASYNC,B901,TD002
+    uv run pyright -p pyrightconfig.samples.json --warnings
+else
+    echo "No sample files changed, skipping samples checks"
+fi
+"""
+interpreter = "bash"
+args = [{ name = "files", default = ".", positional = true, multiple = true }]
+
+
+[tool.poe.tasks.ci-mypy]
+shell = """
+# Try multiple strategies to get changed files
+if [ -n "$GITHUB_BASE_REF" ]; then
+    # In GitHub Actions PR context
+    git fetch origin $GITHUB_BASE_REF --depth=1 2>/dev/null || true
+    CHANGED_FILES=$(git diff --name-only origin/$GITHUB_BASE_REF...HEAD -- . 2>/dev/null || \
+                    git diff --name-only FETCH_HEAD...HEAD -- . 2>/dev/null || \
+                    git diff --name-only HEAD^...HEAD -- . 2>/dev/null || \
+                    echo ".")
+else
+    # Local development
+    CHANGED_FILES=$(git diff --name-only origin/main...HEAD -- . 2>/dev/null || \
+                    git diff --name-only main...HEAD -- . 2>/dev/null || \
+                    git diff --name-only HEAD~1 -- . 2>/dev/null || \
+                    echo ".")
+fi
+echo "Changed files: $CHANGED_FILES"
+uv run python scripts/run_tasks_in_changed_packages.py mypy --files $CHANGED_FILES
+"""
+interpreter = "bash"
+
+[tool.poe.tasks.prek-check]
 sequence = [
-    { ref = "clean-dist" },
-    { ref = 'build' },
-    { ref = "docs-clean" },
-    { ref = "docs-build" },
-    { ref = "docs-rename" }
+    { ref = "prek-check-packages ${files}" },
+    { ref = "prek-markdown-code-lint ${files}" },
+    { ref = "prek-samples-check ${files}" }
 ]
-[tool.poe.tasks.docs-full-setup-install]
-sequence = [
-    { ref = "setup --python 3.11" },
-    { ref = "docs-install" },
-    { ref = 'build' },
-    { ref = "docs-clean" },
-    { ref = "docs-build" },
-    { ref = "docs-rename" }
-]
-[tool.poe.tasks.docs-full-install]
-sequence = [
-    { ref = "docs-install" },
-    { ref = 'build' },
-    { ref = "docs-clean" },
-    { ref = "docs-build" },
-    { ref = "docs-rename" }
-]
-[tool.poe.tasks.docs-rebuild]
-sequence = [
-    { ref = "docs-clean" },
-    { ref = "docs-build" },
-    { ref = "docs-rename" }
-]
-[tool.poe.tasks.docs-rebuild-debug]
-sequence = [
-    { ref = "docs-clean" },
-    { ref = "docs-debug" },
-    { ref = "docs-rename" }
-]
+args = [{ name = "files", default = ".", positional = true, multiple = true }]
 
 [tool.setuptools.packages.find]
 where = ["packages"]

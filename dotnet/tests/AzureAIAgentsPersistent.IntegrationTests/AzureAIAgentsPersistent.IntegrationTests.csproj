@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>$(ProjectsTargetFrameworks)</TargetFrameworks>
-    <TargetFrameworks Condition="'$(Configuration)' == 'Debug'">$(ProjectsDebugTargetFrameworks)</TargetFrameworks>
+    <NoWarn>$(NoWarn);CS8793</NoWarn>
     <InjectSharedIntegrationTestCode>True</InjectSharedIntegrationTestCode>
+    <InjectSharedIntegrationTestAzureCredentialsCode>True</InjectSharedIntegrationTestAzureCredentialsCode>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Microsoft.Agents.AI.AzureAI\Microsoft.Agents.AI.AzureAI.csproj" />
+    <ProjectReference Include="..\..\src\Microsoft.Agents.AI.AzureAI.Persistent\Microsoft.Agents.AI.AzureAI.Persistent.csproj" />
     <ProjectReference Include="..\AgentConformance.IntegrationTests\AgentConformance.IntegrationTests.csproj" />
   </ItemGroup>
 

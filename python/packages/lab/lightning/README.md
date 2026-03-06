@@ -8,12 +8,10 @@ This package enables you to train and fine-tune agents using advanced RL algorit
 
 ## Installation
 
-Install from source with Lightning dependencies:
+Install the `agent-framework-lab` package with Lightning dependencies:
 
 ```bash
-git clone https://github.com/microsoft/agent-framework.git
-cd agent-framework/python/packages/lab
-pip install -e ".[lightning]"
+pip install "agent-framework-lab[lightning]"
 ```
 
 ### Optional Dependencies
@@ -26,7 +24,7 @@ pip install -e ".[lightning,math]"
 pip install -e ".[lightning,tau2]"
 ```
 
-To prepare for RL training, you'll also need to install dependencies like PyTorch, Ray, and vLLM. See the [Agent-lightning setup instructions](https://github.com/microsoft/agent-lightning) for more details.
+To prepare for RL training, you'll also need to install dependencies like PyTorch, Ray, and vLLM. See the [Agent-lightning setup instructions](https://microsoft.github.io/agent-lightning/stable/tutorials/installation/) for more details.
 
 ## Usage Patterns
 
@@ -40,7 +38,7 @@ The basic usage pattern follows these steps:
 ### Example Implementation
 
 ```python
-from agent_framework.lab.lightning import init
+from agent_framework.lab.lightning import AgentFrameworkTracer
 from agentlightning import rollout, Trainer, LLM, Dataset
 from agentlightning.algorithm.verl import VERL
 
@@ -51,8 +49,8 @@ async def math_agent(task: TaskType, llm: LLM) -> float:
     """A function that solves a math problem and returns the evaluation score."""
     async with (
         MCPStdioTool(name="calculator", command="uvx", args=["mcp-server-calculator"]) as mcp_server,
-        ChatAgent(
-            chat_client=OpenAIChatClient(
+        Agent(
+            client=OpenAIChatClient(
                 model_id=llm.model,
                 api_key="your-api-key",
                 base_url=llm.endpoint,
@@ -73,10 +71,10 @@ config = {
     # ... additional config
 }
 
-# Initialize agent-framework to send telemetry data to agent-lightning's observability backend
-init()
+# Initialize agent-framework tracer to send telemetry data to agent-lightning's observability backend
+tracer = AgentFrameworkTracer()
 
-trainer = Trainer(algorithm=VERL(config), n_workers=2)
+trainer = Trainer(algorithm=VERL(config), tracer=tracer, n_workers=2)
 # Both train_dataset and val_dataset are lists of TaskType
 trainer.fit(math_agent, train_dataset, val_data=val_dataset)
 ```

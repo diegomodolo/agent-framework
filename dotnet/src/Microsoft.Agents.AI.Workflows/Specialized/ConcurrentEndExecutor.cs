@@ -14,12 +14,14 @@ namespace Microsoft.Agents.AI.Workflows.Specialized;
 /// </summary>
 internal sealed class ConcurrentEndExecutor : Executor, IResettableExecutor
 {
+    public const string ExecutorId = "ConcurrentEnd";
+
     private readonly int _expectedInputs;
     private readonly Func<IList<List<ChatMessage>>, List<ChatMessage>> _aggregator;
     private List<List<ChatMessage>> _allResults;
     private int _remaining;
 
-    public ConcurrentEndExecutor(int expectedInputs, Func<IList<List<ChatMessage>>, List<ChatMessage>> aggregator) : base("ConcurrentEnd")
+    public ConcurrentEndExecutor(int expectedInputs, Func<IList<List<ChatMessage>>, List<ChatMessage>> aggregator) : base(ExecutorId)
     {
         this._expectedInputs = expectedInputs;
         this._aggregator = Throw.IfNull(aggregator);
@@ -34,8 +36,9 @@ internal sealed class ConcurrentEndExecutor : Executor, IResettableExecutor
         this._remaining = this._expectedInputs;
     }
 
-    protected override RouteBuilder ConfigureRoutes(RouteBuilder routeBuilder) =>
-        routeBuilder.AddHandler<List<ChatMessage>>(async (messages, context, cancellationToken) =>
+    protected override ProtocolBuilder ConfigureProtocol(ProtocolBuilder protocolBuilder)
+    {
+        protocolBuilder.RouteBuilder.AddHandler<List<ChatMessage>>(async (messages, context, cancellationToken) =>
         {
             // TODO: https://github.com/microsoft/agent-framework/issues/784
             // This locking should not be necessary.
@@ -55,6 +58,9 @@ internal sealed class ConcurrentEndExecutor : Executor, IResettableExecutor
                 await context.YieldOutputAsync(this._aggregator(results), cancellationToken).ConfigureAwait(false);
             }
         });
+
+        return protocolBuilder.YieldsOutput<List<ChatMessage>>();
+    }
 
     public ValueTask ResetAsync()
     {

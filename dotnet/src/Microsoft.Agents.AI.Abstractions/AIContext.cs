@@ -11,7 +11,7 @@ namespace Microsoft.Agents.AI;
 /// <remarks>
 /// <para>
 /// <see cref="AIContext"/> serves as a container for contextual information that <see cref="AIContextProvider"/> instances
-/// can supply to enhance AI model interactions. This context is combined across multiple providers and merged with
+/// can supply to enhance AI model interactions. This context is merged with
 /// the agent's base configuration before being passed to the underlying AI model.
 /// </para>
 /// <para>
@@ -24,7 +24,7 @@ namespace Microsoft.Agents.AI;
 /// </list>
 /// </para>
 /// <para>
-/// Context information is transient by default and applies only to the current invocation, though messages
+/// Context information is transient by default and applies only to the current invocation, however messages
 /// added through the <see cref="Messages"/> property will be permanently incorporated into the conversation history.
 /// </para>
 /// </remarks>
@@ -56,41 +56,44 @@ public sealed class AIContext
     public string? Instructions { get; set; }
 
     /// <summary>
-    /// Gets or sets a collection of messages to add to the conversation history.
+    /// Gets or sets the sequence of messages to use for the current invocation.
     /// </summary>
     /// <value>
-    /// A list of <see cref="ChatMessage"/> instances to be permanently added to the conversation history,
-    /// or <see langword="null"/> if no messages should be added.
+    /// A sequence of <see cref="ChatMessage"/> instances to be used for the current invocation,
+    /// or <see langword="null"/> if no messages should be used.
     /// </value>
     /// <remarks>
     /// <para>
-    /// Unlike <see cref="Instructions"/> and <see cref="Tools"/>, messages added through this property become
-    /// permanent additions to the conversation history. They will persist beyond the current invocation and
-    /// will be available in future interactions within the same conversation thread.
+    /// Unlike <see cref="Instructions"/> and <see cref="Tools"/>, messages added through this property may become
+    /// permanent additions to the conversation history.
+    /// If chat history is managed by the underlying AI service, these messages will become part of chat history.
+    /// If chat history is managed using a <see cref="ChatHistoryProvider"/>, these messages will be passed to the
+    /// <see cref="ChatHistoryProvider.InvokedCoreAsync(ChatHistoryProvider.InvokedContext, System.Threading.CancellationToken)"/> method,
+    /// and the provider can choose which of these messages to permanently add to the conversation history.
     /// </para>
     /// <para>
     /// This property is useful for:
     /// <list type="bullet">
-    /// <item><description>Injecting relevant historical context or background information</description></item>
+    /// <item><description>Injecting relevant historical context e.g. memories</description></item>
+    /// <item><description>Injecting relevant background information e.g. via Retrieval Augmented Generation</description></item>
     /// <item><description>Adding system messages that provide ongoing context</description></item>
-    /// <item><description>Including retrieved information that should be part of the conversation record</description></item>
-    /// <item><description>Inserting contextual exchanges that inform the current conversation</description></item>
     /// </list>
     /// </para>
     /// </remarks>
-    public IList<ChatMessage>? Messages { get; set; }
+    public IEnumerable<ChatMessage>? Messages { get; set; }
 
     /// <summary>
-    /// Gets or sets a collection of tools or functions to make available to the AI model for the current invocation.
+    /// Gets or sets a sequence of tools or functions to make available to the AI model for the current invocation.
     /// </summary>
     /// <value>
-    /// A list of <see cref="AITool"/> instances that will be available to the AI model during the current invocation,
+    /// A sequence of <see cref="AITool"/> instances that will be available to the AI model during the current invocation,
     /// or <see langword="null"/> if no additional tools should be provided.
     /// </value>
     /// <remarks>
     /// <para>
-    /// These tools are transient and apply only to the current AI model invocation. They are combined with any
-    /// tools already configured for the agent to provide an expanded set of capabilities for the specific interaction.
+    /// These tools are transient and apply only to the current AI model invocation. Any existing tools
+    /// are provided as input to the <see cref="AIContextProvider"/> instances, so context providers can choose to modify or replace the existing tools
+    /// as needed based on the current context. The resulting set of tools is then passed to the underlying AI model, which may choose to utilize them when generating responses.
     /// </para>
     /// <para>
     /// Context-specific tools enable:
@@ -102,5 +105,5 @@ public sealed class AIContext
     /// </list>
     /// </para>
     /// </remarks>
-    public IList<AITool>? Tools { get; set; }
+    public IEnumerable<AITool>? Tools { get; set; }
 }

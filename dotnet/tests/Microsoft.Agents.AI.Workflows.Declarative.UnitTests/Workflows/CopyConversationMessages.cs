@@ -49,7 +49,7 @@ public static class WorkflowProvider
     /// <summary>
     /// Copies one or more messages into the specified agent conversation.
     /// </summary>
-    internal sealed class CopyMessagesExecutor(FormulaSession session, WorkflowAgentProvider agentProvider) : ActionExecutor(id: "copy_messages", session)
+    internal sealed class CopyMessagesExecutor(FormulaSession session, ResponseAgentProvider agentProvider) : ActionExecutor(id: "copy_messages", session)
     {
         // <inheritdoc />
         protected override async ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken)
@@ -90,6 +90,6 @@ public static class WorkflowProvider
         builder.AddEdge(workflowTest, copyMessages);
 
         // Build the workflow
-        return builder.Build();
+        return builder.Build(validateOrphans: false);
     }
 }

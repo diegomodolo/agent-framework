@@ -8,6 +8,8 @@ using an MCP calculator tool.
 One GPU with 40GB of memory is sufficient for this sample.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -18,11 +20,9 @@ import string
 from typing import TypedDict, cast
 
 import sympy  # type: ignore[import-untyped,reportMissingImports]
-from agent_framework._agents import ChatAgent
-from agent_framework._mcp import MCPStdioTool
-from agent_framework._types import AgentRunResponse
-from agent_framework.openai._chat_client import OpenAIChatClient
-from agent_framework_lab_lightning import init as lightning_init
+from agent_framework import Agent, AgentResponse, MCPStdioTool
+from agent_framework.lab.lightning import AgentFrameworkTracer
+from agent_framework.openai import OpenAIChatClient
 from agentlightning import LLM, Dataset, Trainer, rollout
 from agentlightning.algorithm.verl import VERL
 
@@ -104,7 +104,7 @@ def _is_result_correct(prediction: str, ground_truth: str) -> float:
     return float(_scalar_are_results_same(prediction, ground_truth, 1e-2))
 
 
-def evaluate(result: AgentRunResponse, ground_truth: str) -> float:
+def evaluate(result: AgentResponse, ground_truth: str) -> float:
     """Main evaluation function that extracts the agent's answer and compares with ground truth.
 
     This function:
@@ -166,8 +166,8 @@ async def math_agent(task: MathProblem, llm: LLM) -> float:
     # MCPStdioTool provides calculator functionality via MCP protocol
     async with (
         MCPStdioTool(name="calculator", command="uvx", args=["mcp-server-calculator"]) as mcp_server,
-        ChatAgent(
-            chat_client=OpenAIChatClient(
+        Agent(
+            client=OpenAIChatClient(
                 model_id=llm.model,  # This is the model being trained
                 api_key=os.getenv("OPENAI_API_KEY") or "dummy",  # Can be dummy when connecting to training LLM
                 base_url=llm.endpoint,  # vLLM server endpoint provided by agent-lightning
@@ -192,10 +192,6 @@ def main():
     # This configuration controls all aspects of the RL training process.
     # Key sections: algorithm, data, rollout, actor, trainer
     rl_training_config = {
-        "agentlightning": {
-            # The port to communicate between the rollout workers and the RL training process
-            "port": 9999,
-        },
         "algorithm": {
             # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
             "adv_estimator": "grpo"
@@ -280,10 +276,6 @@ def main():
         },
     }
 
-    # Initialize and run training
-    # lightning_init() enables observability integration with agent-framework
-    lightning_init()
-
     # Load your datasets
     train_dataset = _load_jsonl("data/math/train.jsonl")
     val_dataset = _load_jsonl("data/math/test.jsonl")
@@ -298,13 +290,13 @@ def main():
 
     # Create trainer with VERL algorithm and start training
     # n_workers: Number of rollout workers (processes) for parallel data collection
-    trainer = Trainer(algorithm=VERL(rl_training_config), n_workers=2)
+    trainer = Trainer(algorithm=VERL(rl_training_config), tracer=AgentFrameworkTracer(), n_workers=2)
 
     # This starts the actual RL training loop:
     # 1. Collect rollouts using current model
     # 2. Compute advantages and train the model
     # 3. Repeat for specified number of epochs
-    trainer.fit(math_agent, train_dataset, val_data=val_dataset)
+    trainer.fit(math_agent, train_dataset, val_dataset=val_dataset)
 
 
 def debug():

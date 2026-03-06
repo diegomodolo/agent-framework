@@ -2,7 +2,6 @@
 
 using System;
 using System.Net.Http;
-using System.Threading.Tasks;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.Logging;
 
@@ -28,11 +27,11 @@ public static class A2AAgentCardExtensions
     /// <param name="httpClient">The <see cref="HttpClient"/> to use for HTTP requests.</param>
     /// <param name="loggerFactory">The logger factory for enabling logging within the agent.</param>
     /// <returns>An <see cref="AIAgent"/> instance backed by the A2A agent.</returns>
-    public static async Task<AIAgent> GetAIAgentAsync(this AgentCard card, HttpClient? httpClient = null, ILoggerFactory? loggerFactory = null)
+    public static AIAgent AsAIAgent(this AgentCard card, HttpClient? httpClient = null, ILoggerFactory? loggerFactory = null)
     {
         // Create the A2A client using the agent URL from the card.
         var a2aClient = new A2AClient(new Uri(card.Url), httpClient);
 
-        return a2aClient.GetAIAgent(name: card.Name, description: card.Description, loggerFactory: loggerFactory);
+        return a2aClient.AsAIAgent(name: card.Name, description: card.Description, loggerFactory: loggerFactory);
     }
 }

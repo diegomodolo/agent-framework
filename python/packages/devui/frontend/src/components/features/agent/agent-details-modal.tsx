@@ -94,14 +94,14 @@ export function AgentDetailsModal({
           {/* Grid Layout for Metadata */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
             {/* Model & Client */}
-            {(agent.model || agent.chat_client_type) && (
+            {(agent.model_id || agent.chat_client_type) && (
               <DetailCard
                 title="Model & Client"
                 icon={<Bot className="h-4 w-4 text-muted-foreground" />}
               >
                 <div className="space-y-1">
-                  {agent.model && (
-                    <div className="font-mono text-foreground">{agent.model}</div>
+                  {agent.model_id && (
+                    <div className="font-mono text-foreground">{agent.model_id}</div>
                   )}
                   {agent.chat_client_type && (
                     <div className="text-xs">({agent.chat_client_type})</div>
@@ -136,7 +136,9 @@ export function AgentDetailsModal({
             >
               <div
                 className={
-                  agent.has_env ? "text-orange-600 dark:text-orange-400" : "text-green-600 dark:text-green-400"
+                  agent.has_env
+                    ? "text-orange-600 dark:text-orange-400"
+                    : "text-green-600 dark:text-green-400"
                 }
               >
                 {agent.has_env
@@ -159,14 +161,14 @@ export function AgentDetailsModal({
             </DetailCard>
           )}
 
-          {/* Tools and Middleware Grid */}
+          {/* Tools and MiddlewareTypes Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* Tools */}
-            <DetailCard
-              title={`Tools (${agent.tools.length})`}
-              icon={<Package className="h-4 w-4 text-muted-foreground" />}
-            >
-              {agent.tools.length > 0 ? (
+            {agent.tools && agent.tools.length > 0 && (
+              <DetailCard
+                title={`Tools (${agent.tools.length})`}
+                icon={<Package className="h-4 w-4 text-muted-foreground" />}
+              >
                 <ul className="space-y-1">
                   {agent.tools.map((tool, index) => (
                     <li key={index} className="font-mono text-xs text-foreground">
@@ -174,15 +176,13 @@ export function AgentDetailsModal({
                     </li>
                   ))}
                 </ul>
-              ) : (
-                <div className="text-muted-foreground">No tools configured</div>
-              )}
-            </DetailCard>
+              </DetailCard>
+            )}
 
-            {/* Middleware */}
+            {/* Middlewares */}
             {agent.middleware && agent.middleware.length > 0 && (
               <DetailCard
-                title={`Middleware (${agent.middleware.length})`}
+                title={`Middlewares (${agent.middleware.length})`}
                 icon={<Package className="h-4 w-4 text-muted-foreground" />}
               >
                 <ul className="space-y-1">
@@ -195,20 +195,16 @@ export function AgentDetailsModal({
               </DetailCard>
             )}
 
-            {/* Context Providers */}
-            {agent.context_providers && agent.context_providers.length > 0 && (
+            {/* Context Provider */}
+            {agent.context_provider && (
               <DetailCard
-                title={`Context Providers (${agent.context_providers.length})`}
+                title="Context Provider"
                 icon={<Database className="h-4 w-4 text-muted-foreground" />}
                 className={!agent.middleware || agent.middleware.length === 0 ? "md:col-start-2" : ""}
               >
-                <ul className="space-y-1">
-                  {agent.context_providers.map((cp, index) => (
-                    <li key={index} className="font-mono text-xs text-foreground">
-                      • {cp}
-                    </li>
-                  ))}
-                </ul>
+                <div className="font-mono text-xs text-foreground">
+                  {agent.context_provider}
+                </div>
               </DetailCard>
             )}
           </div>

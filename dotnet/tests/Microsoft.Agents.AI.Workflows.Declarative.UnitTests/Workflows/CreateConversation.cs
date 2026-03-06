@@ -51,7 +51,7 @@ public static class WorkflowProvider
     /// <summary>
     /// Creates a new conversation and stores the identifier value to the "Local.PrivateConversationId" variable.
     /// </summary>
-    internal sealed class ConversationCreateExecutor(FormulaSession session, WorkflowAgentProvider agentProvider) : ActionExecutor(id: "conversation_create", session)
+    internal sealed class ConversationCreateExecutor(FormulaSession session, ResponseAgentProvider agentProvider) : ActionExecutor(id: "conversation_create", session)
     {
         protected override async ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken)
         {
@@ -83,6 +83,6 @@ public static class WorkflowProvider
         builder.AddEdge(workflowTest, conversationCreate);
 
         // Build the workflow
-        return builder.Build();
+        return builder.Build(validateOrphans: false);
     }
 }

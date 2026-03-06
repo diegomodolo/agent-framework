@@ -51,7 +51,7 @@ public static class WorkflowProvider
     /// <summary>
     /// Retrieves a specific message from an agent conversation.
     /// </summary>
-    internal sealed class GetMessagesAllExecutor(FormulaSession session, WorkflowAgentProvider agentProvider) : ActionExecutor(id: "get_messages_all", session)
+    internal sealed class GetMessagesAllExecutor(FormulaSession session, ResponseAgentProvider agentProvider) : ActionExecutor(id: "get_messages_all", session)
     {
         // <inheritdoc />
         protected override async ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken)
@@ -99,6 +99,6 @@ public static class WorkflowProvider
         builder.AddEdge(workflowTest, getMessagesAll);
 
         // Build the workflow
-        return builder.Build();
+        return builder.Build(validateOrphans: false);
     }
 }

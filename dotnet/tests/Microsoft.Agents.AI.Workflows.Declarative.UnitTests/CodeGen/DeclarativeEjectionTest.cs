@@ -4,7 +4,6 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 using Shared.Code;
-using Xunit.Abstractions;
 
 namespace Microsoft.Agents.AI.Workflows.Declarative.UnitTests.CodeGen;
 
@@ -15,6 +14,7 @@ public sealed class DeclarativeEjectionTest(ITestOutputHelper output) : Workflow
 {
     [Theory]
     [InlineData("AddConversationMessage.yaml")]
+    [InlineData("CancelWorkflow.yaml")]
     [InlineData("ClearAllVariables.yaml")]
     [InlineData("CopyConversationMessages.yaml")]
     [InlineData("Condition.yaml")]
@@ -23,7 +23,7 @@ public sealed class DeclarativeEjectionTest(ITestOutputHelper output) : Workflow
     [InlineData("EditTable.yaml")]
     [InlineData("EditTableV2.yaml")]
     [InlineData("EndConversation.yaml")]
-    [InlineData("EndDialog.yaml")]
+    [InlineData("EndWorkflow.yaml")]
     [InlineData("Goto.yaml")]
     [InlineData("InvokeAgent.yaml")]
     [InlineData("LoopBreak.yaml")]

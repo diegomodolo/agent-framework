@@ -1,8 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>$(ProjectsTargetFrameworks)</TargetFrameworks>
-    <TargetFrameworks Condition="'$(Configuration)' == 'Debug'">$(ProjectsDebugTargetFrameworks)</TargetFrameworks>
+    <NoWarn>$(NoWarn);CS8793</NoWarn>
     <InjectSharedIntegrationTestCode>True</InjectSharedIntegrationTestCode>
     <InjectSharedThrow>true</InjectSharedThrow>
   </PropertyGroup>
