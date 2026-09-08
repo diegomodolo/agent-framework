@@ -442,12 +442,18 @@ public sealed class AnthropicBetaServiceExtensionsTests
         public TimeSpan? Timeout { get => throw new NotImplementedException(); init => throw new NotImplementedException(); }
         public string? ApiKey { get => throw new NotImplementedException(); init => throw new NotImplementedException(); }
         public string? AuthToken { get => throw new NotImplementedException(); init => throw new NotImplementedException(); }
+        public string? WebhookKey { get => throw new NotImplementedException(); init => throw new NotImplementedException(); }
+        public IReadOnlyList<DelegatingHandler> Handlers { get => throw new NotImplementedException(); init => throw new NotImplementedException(); }
 
         public IAnthropicClientWithRawResponse WithRawResponse => throw new NotImplementedException();
 
         public IMessageService Messages => throw new NotImplementedException();
 
         public IModelService Models => throw new NotImplementedException();
+
+        public IFileService Files => throw new NotImplementedException();
+
+        public ISkillService Skills => throw new NotImplementedException();
 
         public IBetaService Beta => this.BetaService;
 
@@ -482,6 +488,30 @@ public sealed class AnthropicBetaServiceExtensionsTests
             public global::Anthropic.Services.Beta.ISkillService Skills => throw new NotImplementedException();
 
             public IBetaMessageService Messages => new Mock<IBetaMessageService>().Object;
+
+            public global::Anthropic.Services.Beta.IAgentService Agents => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IEnvironmentService Environments => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.ISessionService Sessions => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IDeploymentService Deployments => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IDeploymentRunService DeploymentRuns => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IVaultService Vaults => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IMemoryStoreService MemoryStores => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IWebhookService Webhooks => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IUserProfileService UserProfiles => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IDreamService Dreams => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.ITunnelService Tunnels => throw new NotImplementedException();
+
+            public global::Anthropic.Services.Beta.IOrganizationService Organization => throw new NotImplementedException();
 
             public IBetaService WithOptions(Func<ClientOptions, ClientOptions> modifier)
             {

@@ -2,7 +2,7 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Azure.AI.OpenAI;
+using Azure.AI.Projects;
 using Azure.Identity;
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.Workflows;
@@ -35,14 +35,14 @@ public static class Program
 {
     private static async Task Main()
     {
-        // Set up the Azure OpenAI client
-        var endpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT") ?? throw new InvalidOperationException("AZURE_OPENAI_ENDPOINT is not set.");
-        var deploymentName = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT_NAME") ?? "gpt-4o-mini";
-        var chatClient = new AzureOpenAIClient(new Uri(endpoint), new AzureCliCredential()).GetChatClient(deploymentName).AsIChatClient();
+        // Set up the Microsoft Foundry client
+        var endpoint = Environment.GetEnvironmentVariable("FOUNDRY_PROJECT_ENDPOINT") ?? throw new InvalidOperationException("FOUNDRY_PROJECT_ENDPOINT is not set.");
+        var deploymentName = Environment.GetEnvironmentVariable("FOUNDRY_MODEL") ?? "gpt-5.4-mini";
+        AIProjectClient aiProjectClient = new(new Uri(endpoint), new DefaultAzureCredential());
 
         // Create agents
-        AIAgent spamDetectionAgent = GetSpamDetectionAgent(chatClient);
-        AIAgent emailAssistantAgent = GetEmailAssistantAgent(chatClient);
+        AIAgent spamDetectionAgent = GetSpamDetectionAgent(aiProjectClient, deploymentName);
+        AIAgent emailAssistantAgent = GetEmailAssistantAgent(aiProjectClient, deploymentName);
 
         // Create executors
         var spamDetectionExecutor = new SpamDetectionExecutor(spamDetectionAgent);
@@ -85,6 +85,18 @@ public static class Program
             {
                 Console.WriteLine($"{outputEvent}");
             }
+            else if (evt is WorkflowErrorEvent workflowError)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Error.WriteLine(workflowError.Exception?.ToString() ?? "Unknown workflow error occurred.");
+                Console.ResetColor();
+            }
+            else if (evt is ExecutorFailedEvent executorFailed)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Error.WriteLine($"Executor '{executorFailed.ExecutorId}' failed with {(executorFailed.Data == null ? "unknown error" : $"exception {executorFailed.Data}")}.");
+                Console.ResetColor();
+            }
         }
     }
 
@@ -99,11 +111,12 @@ public static class Program
     /// Creates a spam detection agent.
     /// </summary>
     /// <returns>A ChatClientAgent configured for spam detection</returns>
-    private static ChatClientAgent GetSpamDetectionAgent(IChatClient chatClient) =>
-        new(chatClient, new ChatClientAgentOptions()
+    private static ChatClientAgent GetSpamDetectionAgent(AIProjectClient client, string model) =>
+        client.AsAIAgent(new ChatClientAgentOptions()
         {
             ChatOptions = new()
             {
+                ModelId = model,
                 Instructions = "You are a spam detection assistant that identifies spam emails. Be less confident in your assessments.",
                 ResponseFormat = ChatResponseFormat.ForJsonSchema<DetectionResult>()
             }
@@ -113,11 +126,12 @@ public static class Program
     /// Creates an email assistant agent.
     /// </summary>
     /// <returns>A ChatClientAgent configured for email assistance</returns>
-    private static ChatClientAgent GetEmailAssistantAgent(IChatClient chatClient) =>
-        new(chatClient, new ChatClientAgentOptions()
+    private static ChatClientAgent GetEmailAssistantAgent(AIProjectClient client, string model) =>
+        client.AsAIAgent(new ChatClientAgentOptions()
         {
             ChatOptions = new()
             {
+                ModelId = model,
                 Instructions = "You are an email assistant that helps users draft responses to emails with professionalism.",
                 ResponseFormat = ChatResponseFormat.ForJsonSchema<EmailResponse>()
             }
@@ -252,6 +266,7 @@ internal sealed class EmailAssistantExecutor : Executor<DetectionResult, EmailRe
 /// <summary>
 /// Executor that sends emails.
 /// </summary>
+[YieldsOutput(typeof(string))]
 internal sealed class SendEmailExecutor() : Executor<EmailResponse>("SendEmailExecutor")
 {
     /// <summary>
@@ -264,6 +279,7 @@ internal sealed class SendEmailExecutor() : Executor<EmailResponse>("SendEmailEx
 /// <summary>
 /// Executor that handles spam messages.
 /// </summary>
+[YieldsOutput(typeof(string))]
 internal sealed class HandleSpamExecutor() : Executor<DetectionResult>("HandleSpamExecutor")
 {
     /// <summary>
@@ -285,6 +301,7 @@ internal sealed class HandleSpamExecutor() : Executor<DetectionResult>("HandleSp
 /// <summary>
 /// Executor that handles uncertain emails.
 /// </summary>
+[YieldsOutput(typeof(string))]
 internal sealed class HandleUncertainExecutor() : Executor<DetectionResult>("HandleUncertainExecutor")
 {
     /// <summary>

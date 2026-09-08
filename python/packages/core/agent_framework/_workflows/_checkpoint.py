@@ -52,14 +52,25 @@ class WorkflowCheckpoint:
             allows chaining checkpoints together to form a history of workflow states.
         timestamp: ISO 8601 timestamp when checkpoint was created
         messages: Messages exchanged between executors
-        state: Committed workflow state including user data and executor states.
-            This contains only committed state; pending state changes are not
-            included in checkpoints. Executor states are stored under the
-            reserved key '_executor_state'.
+        state: Committed workflow state including user data, executor states, and
+            edge runner delivery state. This contains only committed state; pending
+            state changes are not included in checkpoints. Executor states are stored
+            under the reserved key '_executor_state', and edge runner state, such as
+            partially filled fan-in buffers, under '_edge_state'.
         pending_request_info_events: Any pending request info events that have not
             yet been processed at the time of checkpointing. This allows the workflow
             to resume with the correct pending events after a restore.
-        iteration_count: Current iteration number when checkpoint was created
+        iteration_count: Current iteration number when checkpoint was created.
+            Note: iteration_count is not guaranteed to be unique across a workflow's
+            lifecycle. It marks the superstep boundary the checkpoint sits on, and the
+            same boundary can carry more than one checkpoint. For example, a run that
+            pauses at ``IDLE_WITH_PENDING_REQUESTS`` records a checkpoint after superstep
+            K; when responses are later delivered, a response-entry checkpoint is recorded
+            at the same iteration K (responses in-flight, before superstep K+1 runs).
+            Both share iteration K but are distinct checkpoints. Checkpoint ordering is
+            defined by the ``previous_checkpoint_id`` lineage chain (and ``timestamp``),
+            not by ``iteration_count``; do not use ``iteration_count`` to identify the
+            latest checkpoint in human-in-the-loop flows.
         metadata: Additional metadata (e.g., superstep info, graph signature)
         version: Checkpoint format version
 
@@ -120,7 +131,7 @@ class CheckpointStorage(Protocol):
     """Protocol for checkpoint storage backends."""
 
     async def save(self, checkpoint: WorkflowCheckpoint) -> CheckpointID:
-        """Save a checkpoint and return its ID.
+        """Create a copy of the given checkpoint and store it, returning its ID.
 
         Args:
             checkpoint: The WorkflowCheckpoint object to save.
@@ -137,7 +148,7 @@ class CheckpointStorage(Protocol):
             checkpoint_id: The unique ID of the checkpoint to load.
 
         Returns:
-            The WorkflowCheckpoint object corresponding to the given ID.
+            A copy of the WorkflowCheckpoint object corresponding to the given ID.
 
         Raises:
             WorkflowCheckpointException: If no checkpoint with the given ID exists.
@@ -151,7 +162,7 @@ class CheckpointStorage(Protocol):
             workflow_name: The name of the workflow to list checkpoints for.
 
         Returns:
-            A list of WorkflowCheckpoint objects for the specified workflow name.
+            A list of copies of WorkflowCheckpoint objects for the specified workflow name.
         """
         ...
 
@@ -173,7 +184,8 @@ class CheckpointStorage(Protocol):
             workflow_name: The name of the workflow to get the latest checkpoint for.
 
         Returns:
-            The latest WorkflowCheckpoint object for the specified workflow name, or None if no checkpoints exist.
+            A copy of the latest WorkflowCheckpoint object for the specified workflow name,
+            or None if no checkpoints exist.
         """
         ...
 
@@ -197,7 +209,7 @@ class InMemoryCheckpointStorage:
         self._checkpoints: dict[CheckpointID, WorkflowCheckpoint] = {}
 
     async def save(self, checkpoint: WorkflowCheckpoint) -> CheckpointID:
-        """Save a checkpoint and return its ID."""
+        """Create a copy of the given checkpoint and store it, returning its ID."""
         self._checkpoints[checkpoint.checkpoint_id] = copy.deepcopy(checkpoint)
         logger.debug(f"Saved checkpoint {checkpoint.checkpoint_id} to memory")
         return checkpoint.checkpoint_id
@@ -207,12 +219,12 @@ class InMemoryCheckpointStorage:
         checkpoint = self._checkpoints.get(checkpoint_id)
         if checkpoint:
             logger.debug(f"Loaded checkpoint {checkpoint_id} from memory")
-            return checkpoint
+            return copy.deepcopy(checkpoint)
         raise WorkflowCheckpointException(f"No checkpoint found with ID {checkpoint_id}")
 
     async def list_checkpoints(self, *, workflow_name: str) -> list[WorkflowCheckpoint]:
         """List checkpoint objects for a given workflow name."""
-        return [cp for cp in self._checkpoints.values() if cp.workflow_name == workflow_name]
+        return [copy.deepcopy(cp) for cp in self._checkpoints.values() if cp.workflow_name == workflow_name]
 
     async def delete(self, checkpoint_id: CheckpointID) -> bool:
         """Delete a checkpoint by ID."""
@@ -229,7 +241,7 @@ class InMemoryCheckpointStorage:
             return None
         latest_checkpoint = max(checkpoints, key=lambda cp: datetime.fromisoformat(cp.timestamp))
         logger.debug(f"Latest checkpoint for workflow {workflow_name} is {latest_checkpoint.checkpoint_id}")
-        return latest_checkpoint
+        return copy.deepcopy(latest_checkpoint)
 
     async def list_checkpoint_ids(self, *, workflow_name: str) -> list[CheckpointID]:
         """List checkpoint IDs. If workflow_id is provided, filter by that workflow."""
@@ -244,14 +256,40 @@ class FileCheckpointStorage:
     is serialized using pickle and embedded as base64-encoded strings within the JSON. This allows
     for human-readable checkpoint files while preserving the ability to store complex Python objects.
 
-    SECURITY WARNING: Checkpoints use pickle for data serialization. Only load checkpoints
-    from trusted sources. Loading a malicious checkpoint file can execute arbitrary code.
+    By default, checkpoint deserialization is restricted to a built-in set of safe Python types
+    (primitives, datetime, uuid, ...), all ``agent_framework`` internal types, and OpenAI SDK types
+    (``openai.types``). To allow additional application-specific types, register them with
+    ``agent_framework.register_checkpoint_type`` or pass them via the ``allowed_checkpoint_types``
+    parameter using ``"module:qualname"`` format.
+
+    Example::
+
+        storage = FileCheckpointStorage(
+            "/tmp/checkpoints",
+            allowed_checkpoint_types=[
+                "my_app.models:MyState",
+            ],
+        )
     """
 
-    def __init__(self, storage_path: str | Path):
-        """Initialize the file storage."""
+    def __init__(
+        self,
+        storage_path: str | Path,
+        *,
+        allowed_checkpoint_types: list[str] | None = None,
+    ) -> None:
+        """Initialize the file storage.
+
+        Args:
+            storage_path: Directory path where checkpoint files will be stored.
+            allowed_checkpoint_types: Additional types (beyond the built-in safe set
+                and framework types) that are permitted during checkpoint
+                deserialization.  Each entry should be a ``"module:qualname"``
+                string (e.g., ``"my_app.models:MyState"``).
+        """
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
+        self._allowed_types: frozenset[str] = frozenset(allowed_checkpoint_types or [])
         logger.info(f"Initialized file checkpoint storage at {self.storage_path}")
 
     def _validate_file_path(self, checkpoint_id: CheckpointID) -> Path:
@@ -320,14 +358,14 @@ class FileCheckpointStorage:
 
         def _read() -> dict[str, Any]:
             with open(file_path) as f:
-                return json.load(f)  # type: ignore[no-any-return]
+                return json.load(f)
 
         encoded_checkpoint = await asyncio.to_thread(_read)
 
         from ._checkpoint_encoding import decode_checkpoint_value
 
         try:
-            decoded_checkpoint_dict = decode_checkpoint_value(encoded_checkpoint)
+            decoded_checkpoint_dict = decode_checkpoint_value(encoded_checkpoint, allowed_types=self._allowed_types)
         except WorkflowCheckpointException:
             raise
         checkpoint = WorkflowCheckpoint.from_dict(decoded_checkpoint_dict)
@@ -352,7 +390,9 @@ class FileCheckpointStorage:
                         encoded_checkpoint = json.load(f)
                         from ._checkpoint_encoding import decode_checkpoint_value
 
-                        decoded_checkpoint_dict = decode_checkpoint_value(encoded_checkpoint)
+                        decoded_checkpoint_dict = decode_checkpoint_value(
+                            encoded_checkpoint, allowed_types=self._allowed_types
+                        )
                         checkpoint = WorkflowCheckpoint.from_dict(decoded_checkpoint_dict)
                     if checkpoint.workflow_name == workflow_name:
                         checkpoints.append(checkpoint)

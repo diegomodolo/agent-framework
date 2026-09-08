@@ -1,5 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+#pragma warning disable OPENAI001 // Experimental OpenAI features
+
 using System.ClientModel;
 using OpenAI.Chat;
 
@@ -23,6 +25,7 @@ internal sealed class AsyncStreamingChatCompletionUpdateCollectionResult : Async
 
     protected override IAsyncEnumerable<StreamingChatCompletionUpdate> GetValuesFromPageAsync(ClientResult page)
     {
+        FeatureUsageMarker.MarkUsed();
         var updates = ((ClientResult<IAsyncEnumerable<AgentResponseUpdate>>)page).Value;
 
         return updates.AsChatResponseUpdatesAsync().AsOpenAIStreamingChatCompletionUpdatesAsync();

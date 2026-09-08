@@ -88,6 +88,10 @@ public sealed class InMemoryChatHistoryProvider : ChatHistoryProvider
     /// <inheritdoc />
     protected override async ValueTask<IEnumerable<ChatMessage>> ProvideChatHistoryAsync(InvokingContext context, CancellationToken cancellationToken = default)
     {
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreInMemoryHistoryProvider);
+#pragma warning restore MAAI001
+
         State state = this._sessionState.GetOrInitializeState(context.Session);
 
         if (this.ReducerTriggerEvent is InMemoryChatHistoryProviderOptions.ChatReducerTriggerEvent.BeforeMessagesRetrieval && this.ChatReducer is not null)
@@ -102,10 +106,14 @@ public sealed class InMemoryChatHistoryProvider : ChatHistoryProvider
     /// <inheritdoc />
     protected override async ValueTask StoreChatHistoryAsync(InvokedContext context, CancellationToken cancellationToken = default)
     {
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreInMemoryHistoryProvider);
+#pragma warning restore MAAI001
+
         State state = this._sessionState.GetOrInitializeState(context.Session);
 
         // Add request and response messages to the provider
-        var allNewMessages = context.RequestMessages.Concat(context.ResponseMessages ?? []);
+        var allNewMessages = (context.RequestMessages ?? []).Concat(context.ResponseMessages ?? []);
         state.Messages.AddRange(allNewMessages);
 
         if (this.ReducerTriggerEvent is InMemoryChatHistoryProviderOptions.ChatReducerTriggerEvent.AfterMessageAdded && this.ChatReducer is not null)

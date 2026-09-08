@@ -24,13 +24,17 @@ jobs:
     outputs:
       pythonChanges: ${{ steps.filter.outputs.python}}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
             python:
               - 'python/**'
+              - '!python/AGENTS.md'
+              - '!python/**/AGENTS.md'
+              - '!python/.github/skills/*'
+              - '!python/.github/skills/**'
       # run only if 'python' files were changed
       - name: python tests
         if: steps.filter.outputs.python == 'true'
@@ -59,7 +63,7 @@ jobs:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up python and install the project
         id: python-setup
@@ -67,7 +71,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           os: ${{ runner.os }}
-          exclude-packages: ${{ matrix.python-version == '3.10' && 'agent-framework-github-copilot' || '' }}
+          exclude-packages: ${{ matrix.python-version == '3.10' && 'agent-framework-github-copilot agent-framework-azure-cosmos-memory' || '' }}
         env:
           # Configure a constant location for the uv cache
           UV_CACHE_DIR: /tmp/.uv-cache
@@ -88,13 +92,10 @@ jobs:
       - name: Run lab type checking
         run: cd packages/lab && uv run poe pyright
 
-      - name: Run lab mypy
-        run: cd packages/lab && uv run poe mypy
-
       # Surface failing tests
       - name: Surface failing tests
         if: always()
-        uses: pmeier/pytest-results-action@v0.7.2
+        uses: pmeier/pytest-results-action@fdc7f18d9934e38aca411ca9557e6577bd25ca9c # v0.9.0
         with:
           path: ./python/packages/lab/**.xml
           summary: true

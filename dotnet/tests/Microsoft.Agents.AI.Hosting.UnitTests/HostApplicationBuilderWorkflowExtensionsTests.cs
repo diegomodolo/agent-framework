@@ -2,7 +2,9 @@
 
 using System;
 using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.Agents.AI.Workflows;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Moq;
@@ -104,6 +106,30 @@ public class HostApplicationBuilderWorkflowExtensionsTests
     }
 
     /// <summary>
+    /// Verifies that a handoff workflow can be named from the DI workflow key.
+    /// </summary>
+    [Fact]
+    public void AddWorkflow_HandoffWorkflowWithName_ResolvesWorkflow()
+    {
+        var builder = new HostApplicationBuilder();
+        const string WorkflowName = "handoffWorkflow";
+
+        var mockAgent = new Mock<AIAgent>();
+        mockAgent.Setup(a => a.Name).Returns("handoffAgent");
+
+#pragma warning disable MAAIW001 // This test covers hosting handoff workflows.
+        builder.AddWorkflow(WorkflowName, (sp, key) =>
+            AgentWorkflowBuilder.CreateHandoffBuilderWith(mockAgent.Object)
+                .WithName(key)
+                .Build());
+#pragma warning restore MAAIW001
+
+        var workflow = builder.Build().Services.GetRequiredKeyedService<Workflow>(WorkflowName);
+
+        Assert.Equal(WorkflowName, workflow.Name);
+    }
+
+    /// <summary>
     /// Verifies that AddWorkflow handles empty strings for name.
     /// </summary>
     [Fact]
@@ -160,6 +186,48 @@ public class HostApplicationBuilderWorkflowExtensionsTests
         var agentDescriptor = builder.Services.FirstOrDefault(
             d => (d.ServiceKey as string) == WorkflowName && d.ServiceType == typeof(AIAgent));
         Assert.NotNull(agentDescriptor);
+    }
+
+    /// <summary>
+    /// Verifies that a workflow registered as an AI agent includes its chat-message output in the response.
+    /// </summary>
+    [Fact]
+    public async Task AddAsAIAgent_IncludesWorkflowOutputInResponseAsync()
+    {
+        // Arrange
+        var builder = new HostApplicationBuilder();
+        const string WorkflowName = "outputWorkflow";
+        builder.AddWorkflow(WorkflowName, (sp, key) => ChatMessageOutputWorkflow.Build(key))
+            .AddAsAIAgent(includeWorkflowOutputsInResponse: true);
+        using var host = builder.Build();
+        AIAgent agent = host.Services.GetRequiredKeyedService<AIAgent>(WorkflowName);
+
+        // Act
+        AgentResponse response = await agent.RunAsync(new ChatMessage(ChatRole.User, "hello"));
+
+        // Assert
+        Assert.Equal("workflow output", response.Text);
+    }
+
+    /// <summary>
+    /// Verifies that a workflow registered as an AI agent excludes its output from the response by default.
+    /// </summary>
+    [Fact]
+    public async Task AddAsAIAgent_DefaultExcludesWorkflowOutputFromResponseAsync()
+    {
+        // Arrange
+        var builder = new HostApplicationBuilder();
+        const string WorkflowName = "outputWorkflow";
+        builder.AddWorkflow(WorkflowName, (sp, key) => ChatMessageOutputWorkflow.Build(key))
+            .AddAsAIAgent();
+        using var host = builder.Build();
+        AIAgent agent = host.Services.GetRequiredKeyedService<AIAgent>(WorkflowName);
+
+        // Act
+        AgentResponse response = await agent.RunAsync(new ChatMessage(ChatRole.User, "hello"));
+
+        // Assert
+        Assert.Empty(response.Messages);
     }
 
     /// <summary>

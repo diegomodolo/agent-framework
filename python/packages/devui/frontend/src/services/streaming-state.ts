@@ -3,25 +3,78 @@
  *
  * Manages browser storage of streaming response state to enable:
  * - Resume interrupted streams after page refresh
- * - Replay cached events before fetching new ones
  * - Graceful recovery from network disconnections
  */
 
 import type { ExtendedResponseStreamEvent } from "@/types/openai";
+
+export interface StreamingTextPart {
+  itemId?: string;
+  contentIndex: number;
+  type: "text" | "refusal";
+  text: string;
+}
+
+export function applyTextDeltaToParts(
+  parts: StreamingTextPart[],
+  event: ExtendedResponseStreamEvent
+): StreamingTextPart[] {
+  if (
+    (event.type !== "response.output_text.delta" && event.type !== "response.refusal.delta") ||
+    !("delta" in event) ||
+    typeof event.delta !== "string" ||
+    event.delta.length === 0
+  ) {
+    return parts;
+  }
+  const partType = event.type === "response.refusal.delta" ? "refusal" : "text";
+  const nextParts = parts.map((part) => ({ ...part }));
+  const existingPart = nextParts.find(
+    (part) =>
+      part.itemId === event.item_id &&
+      part.contentIndex === (event.content_index ?? 0) &&
+      part.type === partType
+  );
+  if (existingPart) {
+    existingPart.text += event.delta;
+  } else {
+    nextParts.push({
+      itemId: event.item_id,
+      contentIndex: event.content_index ?? 0,
+      type: partType,
+      text: event.delta,
+    });
+  }
+  return nextParts;
+}
 
 export interface StreamingState {
   conversationId: string;
   responseId: string;
   lastMessageId?: string;
   lastSequenceNumber: number;
-  events: ExtendedResponseStreamEvent[];
   timestamp: number; // When this state was last updated
   completed: boolean; // Whether the stream completed successfully
-  accumulatedText?: string; // Accumulated text content for quick restoration
+  accumulatedText?: string; // Bounded tail preview for refresh restoration
+  accumulatedTextIsPreview?: boolean;
+  accumulatedTextType?: "text" | "refusal";
+  accumulatedParts?: StreamingTextPart[];
 }
 
 const STORAGE_KEY_PREFIX = "devui_streaming_state_";
 const STATE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_ACCUMULATED_TEXT_PREVIEW_CHARS = 16 * 1024;
+
+interface CreateStreamingStateOptions {
+  conversationId: string;
+  responseId: string;
+  lastMessageId?: string;
+  lastSequenceNumber?: number;
+  accumulatedText?: string;
+  accumulatedTextIsPreview?: boolean;
+  accumulatedTextType?: "text" | "refusal";
+  accumulatedParts?: StreamingTextPart[];
+}
 
 /**
  * Storage key for a specific conversation
@@ -30,17 +83,137 @@ function getStorageKey(conversationId: string): string {
   return `${STORAGE_KEY_PREFIX}${conversationId}`;
 }
 
-/**
- * Extract accumulated text from events (for quick restoration)
- */
-function extractAccumulatedText(events: ExtendedResponseStreamEvent[]): string {
-  let text = "";
-  for (const event of events) {
-    if (event.type === "response.output_text.delta" && "delta" in event) {
-      text += event.delta;
+function normalizeAccumulatedTextPreview(state: StreamingState): StreamingState {
+  if (state.accumulatedParts?.length) {
+    const retained: StreamingTextPart[] = [];
+    let remaining = MAX_ACCUMULATED_TEXT_PREVIEW_CHARS;
+    for (const part of [...state.accumulatedParts].reverse()) {
+      if (remaining <= 0) break;
+      const text = part.text.slice(-remaining);
+      retained.unshift({ ...part, text });
+      remaining -= text.length;
     }
+    const accumulatedText = retained.map((part) => part.text).join("");
+    return {
+      ...state,
+      accumulatedParts: retained,
+      accumulatedText,
+      accumulatedTextIsPreview:
+        state.accumulatedTextIsPreview ||
+        accumulatedText.length < state.accumulatedParts.reduce((total, part) => total + part.text.length, 0),
+    };
   }
-  return text;
+  if (
+    state.accumulatedText === undefined ||
+    state.accumulatedText.length <= MAX_ACCUMULATED_TEXT_PREVIEW_CHARS
+  ) {
+    return state;
+  }
+
+  return {
+    ...state,
+    accumulatedText: state.accumulatedText.slice(-MAX_ACCUMULATED_TEXT_PREVIEW_CHARS),
+    accumulatedTextIsPreview: true,
+  };
+}
+
+/**
+ * Read raw streaming state from storage, including completed entries.
+ */
+function readStreamingState(conversationId: string): StreamingState | null {
+  const key = getStorageKey(conversationId);
+  const data = localStorage.getItem(key);
+
+  if (!data) {
+    return null;
+  }
+
+  const state: StreamingState = JSON.parse(data);
+
+  // Check if state has expired
+  const age = Date.now() - state.timestamp;
+  if (age > STATE_EXPIRY_MS) {
+    clearStreamingState(conversationId);
+    return null;
+  }
+
+  return normalizeAccumulatedTextPreview(state);
+}
+
+/**
+ * Create an initial streaming state snapshot.
+ */
+export function createStreamingState({
+  conversationId,
+  responseId,
+  lastMessageId,
+  lastSequenceNumber = -1,
+  accumulatedText,
+  accumulatedTextIsPreview = false,
+  accumulatedTextType,
+  accumulatedParts,
+}: CreateStreamingStateOptions): StreamingState {
+  return normalizeAccumulatedTextPreview({
+    conversationId,
+    responseId,
+    lastMessageId,
+    lastSequenceNumber,
+    timestamp: Date.now(),
+    completed: false,
+    accumulatedText,
+    accumulatedTextIsPreview,
+    accumulatedTextType,
+    accumulatedParts,
+  });
+}
+
+/**
+ * Apply an incoming stream event to an in-memory streaming state snapshot.
+ */
+export function applyStreamingEventToState(
+  state: StreamingState,
+  event: ExtendedResponseStreamEvent,
+  responseId: string,
+  lastMessageId?: string
+): StreamingState {
+  const sequenceNumber = "sequence_number" in event ? event.sequence_number : undefined;
+  const nextState: StreamingState = {
+    ...state,
+    responseId,
+    lastMessageId,
+    timestamp: Date.now(),
+    completed: event.type === "response.completed" || event.type === "response.failed",
+  };
+
+  if (sequenceNumber !== undefined) {
+    nextState.lastSequenceNumber = sequenceNumber;
+  }
+
+  if (
+    (event.type === "response.output_text.delta" || event.type === "response.refusal.delta") &&
+    "delta" in event &&
+    typeof event.delta === "string" &&
+    event.delta.length > 0
+  ) {
+    const partType = event.type === "response.refusal.delta" ? "refusal" : "text";
+    const existingParts = state.accumulatedParts
+      ? state.accumulatedParts.map((part) => ({ ...part }))
+      : state.accumulatedText
+        ? [{
+            itemId: state.lastMessageId,
+            contentIndex: 0,
+            type: state.accumulatedTextType ?? "text",
+            text: state.accumulatedText,
+          } satisfies StreamingTextPart]
+        : [];
+    const accumulatedParts = applyTextDeltaToParts(existingParts, event);
+    nextState.accumulatedParts = accumulatedParts;
+    nextState.accumulatedText = accumulatedParts.map((part) => part.text).join("");
+    nextState.accumulatedTextIsPreview = state.accumulatedTextIsPreview;
+    nextState.accumulatedTextType = partType;
+  }
+
+  return normalizeAccumulatedTextPreview(nextState);
 }
 
 /**
@@ -49,7 +222,7 @@ function extractAccumulatedText(events: ExtendedResponseStreamEvent[]): string {
 export function saveStreamingState(state: StreamingState): void {
   try {
     const key = getStorageKey(state.conversationId);
-    const data = JSON.stringify(state);
+    const data = JSON.stringify(normalizeAccumulatedTextPreview(state));
     localStorage.setItem(key, data);
   } catch (error) {
     console.error("Failed to save streaming state:", error);
@@ -58,7 +231,7 @@ export function saveStreamingState(state: StreamingState): void {
       clearExpiredStreamingStates();
       // Try again
       const key = getStorageKey(state.conversationId);
-      const data = JSON.stringify(state);
+      const data = JSON.stringify(normalizeAccumulatedTextPreview(state));
       localStorage.setItem(key, data);
     } catch {
       console.error("Failed to save streaming state even after cleanup");
@@ -71,19 +244,8 @@ export function saveStreamingState(state: StreamingState): void {
  */
 export function loadStreamingState(conversationId: string): StreamingState | null {
   try {
-    const key = getStorageKey(conversationId);
-    const data = localStorage.getItem(key);
-
-    if (!data) {
-      return null;
-    }
-
-    const state: StreamingState = JSON.parse(data);
-
-    // Check if state has expired
-    const age = Date.now() - state.timestamp;
-    if (age > STATE_EXPIRY_MS) {
-      clearStreamingState(conversationId);
+    const state = readStreamingState(conversationId);
+    if (!state) {
       return null;
     }
 
@@ -96,54 +258,6 @@ export function loadStreamingState(conversationId: string): StreamingState | nul
   } catch (error) {
     console.error("Failed to load streaming state:", error);
     return null;
-  }
-}
-
-/**
- * Update streaming state with a new event
- */
-export function updateStreamingState(
-  conversationId: string,
-  event: ExtendedResponseStreamEvent,
-  responseId: string,
-  lastMessageId?: string
-): void {
-  try {
-    const existing = loadStreamingState(conversationId);
-    const sequenceNumber = "sequence_number" in event ? event.sequence_number : undefined;
-
-    const newEvents = existing ? [...existing.events, event] : [event];
-
-    const state: StreamingState = {
-      conversationId,
-      responseId,
-      lastMessageId,
-      lastSequenceNumber: sequenceNumber ?? (existing?.lastSequenceNumber ?? -1),
-      events: newEvents,
-      timestamp: Date.now(),
-      completed: event.type === "response.completed" || event.type === "response.failed",
-      accumulatedText: extractAccumulatedText(newEvents),
-    };
-
-    saveStreamingState(state);
-  } catch (error) {
-    console.error("Failed to update streaming state:", error);
-  }
-}
-
-/**
- * Mark streaming state as completed
- */
-export function markStreamingCompleted(conversationId: string): void {
-  try {
-    const existing = loadStreamingState(conversationId);
-    if (existing) {
-      existing.completed = true;
-      existing.timestamp = Date.now();
-      saveStreamingState(existing);
-    }
-  } catch (error) {
-    console.error("Failed to mark streaming as completed:", error);
   }
 }
 

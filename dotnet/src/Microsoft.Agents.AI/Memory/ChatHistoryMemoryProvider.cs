@@ -7,6 +7,7 @@ using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Compliance.Redaction;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.VectorData;
 using Microsoft.Shared.Diagnostics;
@@ -80,7 +81,7 @@ public sealed class ChatHistoryMemoryProvider : MessageAIContextProvider, IDispo
     private readonly VectorStoreCollection<object, Dictionary<string, object?>> _collection;
     private readonly int _maxResults;
     private readonly string _contextPrompt;
-    private readonly bool _enableSensitiveTelemetryData;
+    private readonly Redactor _redactor;
     private readonly ChatHistoryMemoryProviderOptions.SearchBehavior _searchTime;
     private readonly string _toolName;
     private readonly string _toolDescription;
@@ -118,7 +119,7 @@ public sealed class ChatHistoryMemoryProvider : MessageAIContextProvider, IDispo
         options ??= new ChatHistoryMemoryProviderOptions();
         this._maxResults = options.MaxResults.HasValue ? Throw.IfLessThanOrEqual(options.MaxResults.Value, 0) : DefaultMaxResults;
         this._contextPrompt = options.ContextPrompt ?? DefaultContextPrompt;
-        this._enableSensitiveTelemetryData = options.EnableSensitiveTelemetryData;
+        this._redactor = options.EnableSensitiveTelemetryData ? NullRedactor.Instance : (options.Redactor ?? new ReplacingRedactor("<redacted>"));
         this._searchTime = options.SearchTime;
         this._logger = loggerFactory?.CreateLogger<ChatHistoryMemoryProvider>();
         this._toolName = options.FunctionToolName ?? DefaultFunctionToolName;
@@ -153,6 +154,10 @@ public sealed class ChatHistoryMemoryProvider : MessageAIContextProvider, IDispo
     protected override async ValueTask<AIContext> ProvideAIContextAsync(AIContextProvider.InvokingContext context, CancellationToken cancellationToken = default)
     {
         _ = Throw.IfNull(context);
+
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreChatHistoryMemoryProvider);
+#pragma warning restore MAAI001
 
         var state = this._sessionState.GetOrInitializeState(context.Session);
         var searchScope = state.SearchScope;
@@ -195,6 +200,10 @@ public sealed class ChatHistoryMemoryProvider : MessageAIContextProvider, IDispo
         {
             throw new InvalidOperationException($"Using the {nameof(ChatHistoryMemoryProvider)} as a {nameof(MessageAIContextProvider)} is not supported when {nameof(ChatHistoryMemoryProviderOptions.SearchTime)} is set to {ChatHistoryMemoryProviderOptions.SearchBehavior.OnDemandFunctionCalling}.");
         }
+
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreChatHistoryMemoryProvider);
+#pragma warning restore MAAI001
 
         return base.InvokingCoreAsync(context, cancellationToken);
     }
@@ -485,7 +494,7 @@ public sealed class ChatHistoryMemoryProvider : MessageAIContextProvider, IDispo
         GC.SuppressFinalize(this);
     }
 
-    private string? SanitizeLogData(string? data) => this._enableSensitiveTelemetryData ? data : "<redacted>";
+    private string SanitizeLogData(string? data) => this._redactor.Redact(data);
 
     /// <summary>
     /// Rebinds a filter expression's body to use the specified shared parameter,

@@ -83,8 +83,6 @@ StyleCopReport.xml
 *.pgc
 *.pgd
 *.rsp
-# but not Directory.Build.rsp, as it configures directory-level build defaults
-!Directory.Build.rsp
 *.sbr
 *.tlb
 *.tli
@@ -403,3 +401,10 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Foundry agent CLI config (contains secrets, auto-generated)
+.foundry-agent.json
+.foundry-agent-build.log
+
+# Pre-published output for Docker builds
+out/

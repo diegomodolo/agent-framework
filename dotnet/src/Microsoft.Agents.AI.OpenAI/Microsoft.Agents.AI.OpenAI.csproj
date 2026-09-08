@@ -1,8 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <IsReleaseCandidate>true</IsReleaseCandidate>
+    <IsReleased>true</IsReleased>
     <ImplicitUsings>enable</ImplicitUsings>
+    <InjectSharedFeatureUsageUserAgent>true</InjectSharedFeatureUsageUserAgent>
     <InjectSharedThrow>true</InjectSharedThrow>
   </PropertyGroup>
 

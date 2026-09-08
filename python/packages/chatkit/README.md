@@ -2,7 +2,7 @@
 
 This package provides an integration layer between Microsoft Agent Framework
 and [OpenAI ChatKit (Python)](https://github.com/openai/chatkit-python/).
-Specifically, it mirrors the [Agent SDK integration](https://github.com/openai/chatkit-python/blob/main/docs/server.md#agents-sdk-integration), and provides the following helpers:
+Specifically, it mirrors the [Agent SDK integration](https://github.com/openai/chatkit-python/blob/main/docs/quickstart.md#generate-model-responses), and provides the following helpers:
 
 - `stream_agent_response`: A helper to convert a streamed `AgentResponseUpdate`
   from a Microsoft Agent Framework agent that implements `SupportsAgentRun` to ChatKit events.
@@ -64,7 +64,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
 from agent_framework import Agent
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework.openai import OpenAIChatCompletionClient
 from agent_framework.chatkit import simple_to_agent_input, stream_agent_response
 
 from chatkit.server import ChatKitServer
@@ -75,7 +75,7 @@ from your_store import YourStore  # type: ignore[import-not-found]  # Replace wi
 
 # Define your agent with tools
 agent = Agent(
-    client=AzureOpenAIChatClient(credential=AzureCliCredential()),
+    client=OpenAIChatCompletionClient(credential=AzureCliCredential()),
     instructions="You are a helpful assistant.",
     tools=[],  # Add your tools here
 )

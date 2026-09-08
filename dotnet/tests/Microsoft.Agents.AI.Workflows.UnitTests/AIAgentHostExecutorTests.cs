@@ -3,27 +3,18 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
-using FluentAssertions;
+using Microsoft.Agents.AI.Workflows.Execution;
 using Microsoft.Agents.AI.Workflows.Specialized;
 using Microsoft.Extensions.AI;
 
 namespace Microsoft.Agents.AI.Workflows.UnitTests;
 
-public class AIAgentHostExecutorTests
+public class AIAgentHostExecutorTests : AIAgentHostingExecutorTestsBase
 {
-    private const string TestAgentId = nameof(TestAgentId);
-    private const string TestAgentName = nameof(TestAgentName);
-
-    private static readonly string[] s_messageStrings = [
-        "",
-        "Hello world!",
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-        "Quisque dignissim ante odio, at facilisis orci porta a. Duis mi augue, fringilla eu egestas a, pellentesque sed lacus."
-    ];
-
-    private static List<ChatMessage> TestMessages => TestReplayAgent.ToChatMessages(s_messageStrings);
-
     [Theory]
     [InlineData(null, null)]
     [InlineData(null, true)]
@@ -50,30 +41,7 @@ public class AIAgentHostExecutorTests
         bool expectingEvents = turnSetting ?? executorSetting ?? false;
 
         AgentResponseUpdateEvent[] updates = testContext.Events.OfType<AgentResponseUpdateEvent>().ToArray();
-        if (expectingEvents)
-        {
-            // The way TestReplayAgent is set up, it will emit one update per non-empty AIContent
-            List<AIContent> expectedUpdateContents = TestMessages.SelectMany(message => message.Contents).ToList();
-
-            updates.Should().HaveCount(expectedUpdateContents.Count);
-            for (int i = 0; i < updates.Length; i++)
-            {
-                AgentResponseUpdateEvent updateEvent = updates[i];
-                AIContent expectedUpdateContent = expectedUpdateContents[i];
-
-                updateEvent.ExecutorId.Should().Be(agent.GetDescriptiveId());
-
-                AgentResponseUpdate update = updateEvent.Update;
-                update.AuthorName.Should().Be(TestAgentName);
-                update.AgentId.Should().Be(TestAgentId);
-                update.Contents.Should().HaveCount(1);
-                update.Contents[0].Should().BeEquivalentTo(expectedUpdateContent);
-            }
-        }
-        else
-        {
-            updates.Should().BeEmpty();
-        }
+        CheckResponseUpdateEventsAgainstTestMessages(updates, expectingEvents, agent.GetDescriptiveId());
     }
 
     [Theory]
@@ -92,35 +60,79 @@ public class AIAgentHostExecutorTests
 
         // Assert
         AgentResponseEvent[] updates = testContext.Events.OfType<AgentResponseEvent>().ToArray();
-        if (executorSetting)
-        {
-            updates.Should().HaveCount(1);
+        CheckResponseEventsAgainstTestMessages(updates, expectingResponse: executorSetting, agent.GetDescriptiveId());
+    }
 
-            AgentResponseEvent responseEvent = updates[0];
-            responseEvent.ExecutorId.Should().Be(agent.GetDescriptiveId());
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public async Task Test_AgentHostExecutor_AssignsStableMessageIdToContentfulStreamingUpdatesAsync(string? missingMessageId)
+    {
+        // Arrange
+        TestRunContext testContext = new();
+        AIAgentHostExecutor executor =
+            new(
+                new MissingMessageIdAgent(missingMessageId),
+                new()
+                {
+                    EmitAgentUpdateEvents = true,
+                    EmitAgentResponseEvents = true,
+                });
+        testContext.ConfigureExecutor(executor);
 
-            AgentResponse response = responseEvent.Response;
-            response.AgentId.Should().Be(TestAgentId);
-            response.Messages.Should().HaveCount(TestMessages.Count - 1);
+        // Act
+        await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
 
-            for (int i = 0; i < response.Messages.Count; i++)
-            {
-                ChatMessage responseMessage = response.Messages[i];
-                ChatMessage expectedMessage = TestMessages[i + 1]; // Skip the first empty message
+        // Assert
+        AgentResponseUpdateEvent[] updateEvents = testContext.Events.OfType<AgentResponseUpdateEvent>().ToArray();
+        Assert.Equal(3, updateEvents.Length);
+        Assert.Equal(string.Empty, updateEvents[0].Update.MessageId);
 
-                responseMessage.AuthorName.Should().Be(TestAgentName);
-                responseMessage.Text.Should().Be(expectedMessage.Text);
-            }
-        }
-        else
-        {
-            updates.Should().BeEmpty();
-        }
+        string? messageId = updateEvents[1].Update.MessageId;
+        Assert.False(string.IsNullOrEmpty(messageId));
+        Assert.All(updateEvents.Skip(1), updateEvent => Assert.True(updateEvent.Update.MessageId == messageId));
+
+        AgentResponseEvent responseEvent = Assert.Single(testContext.Events.OfType<AgentResponseEvent>());
+        ChatMessage responseMessage = Assert.Single(responseEvent.Response.Messages);
+        Assert.Equal(messageId, responseMessage.MessageId);
+        Assert.Equal("hello world", responseMessage.Text);
     }
 
     private static ChatMessage UserMessage => new(ChatRole.User, "Hello from User!") { AuthorName = "User" };
     private static ChatMessage AssistantMessage => new(ChatRole.Assistant, "Hello from Assistant!") { AuthorName = "User" };
     private static ChatMessage TestAgentMessage => new(ChatRole.Assistant, $"Hello from {TestAgentName}!") { AuthorName = TestAgentName };
+
+    private sealed class MissingMessageIdAgent(string? messageId) : TestReplayAgent
+    {
+        protected override async IAsyncEnumerable<AgentResponseUpdate> RunCoreStreamingAsync(
+            IEnumerable<ChatMessage> messages,
+            AgentSession? session = null,
+            AgentRunOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            yield return new AgentResponseUpdate(
+                new ChatResponseUpdate
+                {
+                    MessageId = "",
+                    ResponseId = "response-id",
+                });
+            yield return new AgentResponseUpdate(
+                new ChatResponseUpdate(ChatRole.Assistant, "hello ")
+                {
+                    MessageId = messageId,
+                    ResponseId = "response-id",
+                });
+            yield return new AgentResponseUpdate(ChatRole.Assistant, "world")
+            {
+                MessageId = messageId,
+                ResponseId = "response-id",
+                Role = null,
+                RawRepresentation = new object(),
+            };
+            await Task.CompletedTask;
+        }
+    }
 
     [Theory]
     [InlineData(true, true, false, false)]
@@ -167,18 +179,18 @@ public class AIAgentHostExecutorTests
         // Act
         await executor.Router.RouteMessageAsync(messages, testContext.BindWorkflowContext(executor.Id));
 
-        Func<Task> act = async () => await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
+        async Task actAsync() => await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
 
         // Assert
         bool shouldThrow = includeOtherMessages && !executorSetting;
 
         if (shouldThrow)
         {
-            await act.Should().ThrowAsync<InvalidOperationException>();
+            await Assert.ThrowsAsync<InvalidOperationException>(actAsync);
         }
         else
         {
-            await act.Should().NotThrowAsync();
+            Assert.Null(await Record.ExceptionAsync(actAsync));
         }
     }
 
@@ -229,7 +241,7 @@ public class AIAgentHostExecutorTests
                     responses = ExtractAndValidateRequestContents<FunctionCallContent>();
                     break;
                 case TestAgentRequestType.UserInputRequest:
-                    responses = ExtractAndValidateRequestContents<UserInputRequestContent>();
+                    responses = ExtractAndValidateRequestContents<ToolApprovalRequestContent>();
                     break;
                 default:
                     throw new NotSupportedException();
@@ -237,8 +249,7 @@ public class AIAgentHostExecutorTests
 
             List<object> ExtractAndValidateRequestContents<TRequest>() where TRequest : AIContent
             {
-                IEnumerable<TRequest> requests = testContext.QueuedMessages.Should().ContainKey(executor.Id)
-                                                            .WhoseValue
+                IEnumerable<TRequest> requests = Assert.Contains(executor.Id, testContext.QueuedMessages)
                                                             .Select(envelope => envelope.Message as TRequest)
                                                             .Where(item => item is not null)
                                                             .Select(item => item!);
@@ -259,10 +270,11 @@ public class AIAgentHostExecutorTests
 
         // Assert 2
         // Since we are not finished, we expect the agent to not have produced a final response (="Remaining: 1")
-        AgentResponseEvent lastResponseEvent = testContext.Events.OfType<AgentResponseEvent>().Should().NotBeEmpty()
-                                                                                                    .And.Subject.Last();
+        List<AgentResponseEvent> agentResponseEvents = testContext.Events.OfType<AgentResponseEvent>().ToList();
+        Assert.NotEmpty(agentResponseEvents);
+        AgentResponseEvent lastResponseEvent = agentResponseEvents.Last();
 
-        lastResponseEvent.Response.Text.Should().Be("Remaining: 1");
+        Assert.Equal("Remaining: 1", lastResponseEvent.Response.Text);
 
         // Act 3
         object finalResponse = responses.Last();
@@ -270,9 +282,230 @@ public class AIAgentHostExecutorTests
 
         // Assert 3
         // Now that we are finished, we expect the agent to have produced a final response
-        lastResponseEvent = testContext.Events.OfType<AgentResponseEvent>().Should().NotBeEmpty()
-                                                                              .And.Subject.Last();
+        agentResponseEvents = testContext.Events.OfType<AgentResponseEvent>().ToList();
+        Assert.NotEmpty(agentResponseEvents);
+        lastResponseEvent = agentResponseEvents.Last();
 
-        lastResponseEvent.Response.Text.Should().Be("Done");
+        Assert.Equal("Done", lastResponseEvent.Response.Text);
     }
+
+    #region FilterForwardableMessages tests
+
+    /// <summary>
+    /// An agent that returns response messages containing a mix of content types,
+    /// including non-portable server-side artifacts like TextReasoningContent and
+    /// unrecognized AIContent subclasses (simulating mcp_list_tools, web_search_call, etc.).
+    /// </summary>
+    private sealed class MixedContentAgent(List<ChatMessage> responseMessages, string? id = null, string? name = null) : AIAgent
+    {
+        protected override string? IdCore => id;
+        public override string? Name => name;
+
+        protected override ValueTask<AgentSession> CreateSessionCoreAsync(CancellationToken cancellationToken = default)
+            => new(new MixedContentSession());
+
+        protected override ValueTask<AgentSession> DeserializeSessionCoreAsync(JsonElement serializedState, JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default)
+            => new(new MixedContentSession());
+
+        protected override ValueTask<JsonElement> SerializeSessionCoreAsync(AgentSession session, JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default)
+            => default;
+
+        protected override Task<AgentResponse> RunCoreAsync(IEnumerable<ChatMessage> messages, AgentSession? session = null, AgentRunOptions? options = null, CancellationToken cancellationToken = default)
+            => Task.FromResult(new AgentResponse(responseMessages.ToList()) { AgentId = this.Id });
+
+        protected override async IAsyncEnumerable<AgentResponseUpdate> RunCoreStreamingAsync(IEnumerable<ChatMessage> messages, AgentSession? session = null, AgentRunOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            foreach (ChatMessage msg in responseMessages)
+            {
+                foreach (AIContent content in msg.Contents)
+                {
+                    yield return new AgentResponseUpdate
+                    {
+                        AgentId = this.Id,
+                        AuthorName = this.Name,
+                        MessageId = msg.MessageId ?? Guid.NewGuid().ToString("N"),
+                        ResponseId = Guid.NewGuid().ToString("N"),
+                        Contents = [content],
+                        Role = msg.Role,
+                    };
+                }
+            }
+        }
+
+        private sealed class MixedContentSession : AgentSession;
+    }
+
+    /// <summary>
+    /// A custom AIContent subclass that simulates an unrecognized provider-specific content type
+    /// (e.g. mcp_list_tools, web_search_call, fabric_dataagent_preview_call).
+    /// </summary>
+    private sealed class UnrecognizedServerContent(string description) : AIContent
+    {
+        public string Description => description;
+    }
+
+    [Fact]
+    public async Task Test_AgentHostExecutor_FiltersNonPortableContentFromForwardedMessagesAsync()
+    {
+        // Arrange: agent returns a mix of text, reasoning, and unrecognized content
+        var responseMessages = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant, [new TextContent("Useful response text")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+                RawRepresentation = "original_response_item_1",
+            },
+            new(ChatRole.Assistant, [new TextReasoningContent("internal thinking")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+                RawRepresentation = "original_reasoning_item",
+            },
+            new(ChatRole.Assistant, [new UnrecognizedServerContent("mcp_list_tools payload")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+                RawRepresentation = "original_mcp_list_tools_item",
+            },
+        };
+
+        TestRunContext testContext = new();
+        MixedContentAgent agent = new(responseMessages, TestAgentId, TestAgentName);
+        AIAgentHostExecutor executor = new(agent, new());
+        testContext.ConfigureExecutor(executor);
+
+        // Act
+        await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
+
+        // Assert: only the text message should be forwarded
+        Assert.Contains(executor.Id, testContext.QueuedMessages);
+        List<MessageEnvelope> sentEnvelopes = testContext.QueuedMessages[executor.Id];
+
+        // Extract forwarded ChatMessage lists (filter out TurnToken)
+        List<ChatMessage> forwardedMessages = sentEnvelopes
+            .Select(e => e.Message)
+            .OfType<List<ChatMessage>>()
+            .SelectMany(list => list)
+            .ToList();
+
+        Assert.Single(forwardedMessages);
+        Assert.Equal(ChatRole.Assistant, forwardedMessages[0].Role);
+        TextContent content = Assert.IsType<TextContent>(Assert.Single(forwardedMessages[0].Contents));
+        Assert.Equal("Useful response text", content.Text);
+    }
+
+    [Fact]
+    public async Task Test_AgentHostExecutor_StripsRawRepresentationFromForwardedMessagesAsync()
+    {
+        // Arrange: agent returns a text message with RawRepresentation set
+        var responseMessages = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant, [new TextContent("Response")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+                RawRepresentation = "provider_specific_response_item",
+            },
+        };
+
+        TestRunContext testContext = new();
+        MixedContentAgent agent = new(responseMessages, TestAgentId, TestAgentName);
+        AIAgentHostExecutor executor = new(agent, new());
+        testContext.ConfigureExecutor(executor);
+
+        // Act
+        await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
+
+        // Assert: forwarded message should NOT have RawRepresentation
+        List<ChatMessage> forwardedMessages = testContext.QueuedMessages[executor.Id]
+            .Select(e => e.Message)
+            .OfType<List<ChatMessage>>()
+            .SelectMany(list => list)
+            .ToList();
+
+        Assert.Single(forwardedMessages);
+        Assert.Null(forwardedMessages[0].RawRepresentation);
+        Assert.Equal(TestAgentName, forwardedMessages[0].AuthorName);
+    }
+
+    [Fact]
+    public async Task Test_AgentHostExecutor_PreservesForwardableContentInMixedMessagesAsync()
+    {
+        // Arrange: a single message with both text and reasoning content
+        var responseMessages = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant,
+            [
+                new TextContent("Visible text"),
+                new TextReasoningContent("Hidden reasoning"),
+                new FunctionCallContent("call_1", "my_function", new Dictionary<string, object?> { ["arg"] = "val" }),
+            ])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+                RawRepresentation = "original_mixed_item",
+            },
+        };
+
+        TestRunContext testContext = new();
+        MixedContentAgent agent = new(responseMessages, TestAgentId, TestAgentName);
+        AIAgentHostExecutor executor = new(agent, new());
+        testContext.ConfigureExecutor(executor);
+
+        // Act
+        await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
+
+        // Assert: message should be forwarded with only the text and function call content
+        List<ChatMessage> forwardedMessages = testContext.QueuedMessages[executor.Id]
+            .Select(e => e.Message)
+            .OfType<List<ChatMessage>>()
+            .SelectMany(list => list)
+            .ToList();
+
+        Assert.Single(forwardedMessages);
+        ChatMessage forwarded = forwardedMessages[0];
+        Assert.Equal(2, forwarded.Contents.Count);
+        Assert.IsType<TextContent>(forwarded.Contents[0]);
+        Assert.IsType<FunctionCallContent>(forwarded.Contents[1]);
+        Assert.Null(forwarded.RawRepresentation);
+    }
+
+    [Fact]
+    public async Task Test_AgentHostExecutor_DropsMessageWithOnlyNonPortableContentAsync()
+    {
+        // Arrange: agent returns only non-portable content
+        var responseMessages = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant, [new TextReasoningContent("reasoning only")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+            },
+            new(ChatRole.Assistant, [new UnrecognizedServerContent("web_search_call")])
+            {
+                AuthorName = TestAgentName,
+                MessageId = Guid.NewGuid().ToString("N"),
+            },
+        };
+
+        TestRunContext testContext = new();
+        MixedContentAgent agent = new(responseMessages, TestAgentId, TestAgentName);
+        AIAgentHostExecutor executor = new(agent, new() { ForwardIncomingMessages = false });
+        testContext.ConfigureExecutor(executor);
+
+        // Act
+        await executor.TakeTurnAsync(new(), testContext.BindWorkflowContext(executor.Id));
+
+        // Assert: no ChatMessage lists should be forwarded (only TurnToken)
+        List<ChatMessage> forwardedMessages = testContext.QueuedMessages[executor.Id]
+            .Select(e => e.Message)
+            .OfType<List<ChatMessage>>()
+            .SelectMany(list => list)
+            .ToList();
+
+        Assert.Empty(forwardedMessages ?? []);
+    }
+
+    #endregion
 }

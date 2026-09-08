@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Compliance.Redaction;
 using Microsoft.Extensions.Logging;
 using Microsoft.Shared.Diagnostics;
 
@@ -62,6 +63,7 @@ public sealed class TextSearchProvider : MessageAIContextProvider
     private readonly string _contextPrompt;
     private readonly string _citationsPrompt;
     private readonly Func<IList<TextSearchResult>, string>? _contextFormatter;
+    private readonly Redactor _redactor;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TextSearchProvider"/> class.
@@ -89,6 +91,7 @@ public sealed class TextSearchProvider : MessageAIContextProvider
         this._contextPrompt = options?.ContextPrompt ?? DefaultContextPrompt;
         this._citationsPrompt = options?.CitationsPrompt ?? DefaultCitationsPrompt;
         this._contextFormatter = options?.ContextFormatter;
+        this._redactor = options?.EnableSensitiveTelemetryData == true ? NullRedactor.Instance : (options?.Redactor ?? new ReplacingRedactor("<redacted>"));
 
         // Create the on-demand search tool (only used if behavior is OnDemandFunctionCalling)
         this._tools =
@@ -106,6 +109,10 @@ public sealed class TextSearchProvider : MessageAIContextProvider
     /// <inheritdoc />
     protected override async ValueTask<AIContext> ProvideAIContextAsync(AIContextProvider.InvokingContext context, CancellationToken cancellationToken = default)
     {
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreTextSearchProvider);
+#pragma warning restore MAAI001
+
         if (this._searchTime != TextSearchProviderOptions.TextSearchBehavior.BeforeAIInvoke)
         {
             // Expose the search tool for on-demand invocation.
@@ -132,6 +139,10 @@ public sealed class TextSearchProvider : MessageAIContextProvider
         {
             throw new InvalidOperationException($"Using the {nameof(TextSearchProvider)} as a {nameof(MessageAIContextProvider)} is not supported when {nameof(TextSearchProviderOptions.SearchTime)} is set to {TextSearchProviderOptions.TextSearchBehavior.OnDemandFunctionCalling}.");
         }
+
+#pragma warning disable MAAI001
+        FeatureUsage.MarkUsed((int)FeatureIndex.CoreTextSearchProvider);
+#pragma warning restore MAAI001
 
         return base.InvokingCoreAsync(context, cancellationToken);
     }
@@ -180,7 +191,7 @@ public sealed class TextSearchProvider : MessageAIContextProvider
 
             if (this._logger?.IsEnabled(LogLevel.Trace) is true)
             {
-                this._logger.LogTrace("TextSearchProvider: Search Results\nInput:{Input}\nOutput:{MessageText}", input, formatted);
+                this._logger.LogTrace("TextSearchProvider: Search Results\nInput:{Input}\nOutput:{MessageText}", this.SanitizeLogData(input), this.SanitizeLogData(formatted));
             }
 
             return [new ChatMessage(ChatRole.User, formatted)];
@@ -249,7 +260,7 @@ public sealed class TextSearchProvider : MessageAIContextProvider
 
             if (this._logger.IsEnabled(LogLevel.Trace))
             {
-                this._logger.LogTrace("TextSearchProvider Input:{UserQuestion}\nOutput:{MessageText}", userQuestion, outputText);
+                this._logger.LogTrace("TextSearchProvider Input:{UserQuestion}\nOutput:{MessageText}", this.SanitizeLogData(userQuestion), this.SanitizeLogData(outputText));
             }
         }
 
@@ -286,11 +297,11 @@ public sealed class TextSearchProvider : MessageAIContextProvider
             {
                 sb.AppendLine($"SourceDocLink: {result.SourceLink}");
             }
-            sb.AppendLine($"Contents: {result.Text}");
-            sb.AppendLine("----");
+            sb.AppendLine($"Contents: {result.Text}")
+                .AppendLine("----");
         }
-        sb.AppendLine(this._citationsPrompt);
-        sb.AppendLine();
+        sb.AppendLine(this._citationsPrompt)
+            .AppendLine();
         return sb.ToString();
     }
 
@@ -324,6 +335,8 @@ public sealed class TextSearchProvider : MessageAIContextProvider
         /// </remarks>
         public object? RawRepresentation { get; set; }
     }
+
+    private string SanitizeLogData(string? data) => this._redactor.Redact(data);
 
     /// <summary>
     /// Represents the per-session state of a <see cref="TextSearchProvider"/> stored in the <see cref="AgentSession.StateBag"/>.

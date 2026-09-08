@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+import inspect
 import logging
 import sys
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from typing_extensions import Never
 
@@ -12,9 +13,9 @@ from agent_framework import Content
 
 from .._agents import SupportsAgentRun
 from .._sessions import AgentSession
-from .._types import AgentResponse, AgentResponseUpdate, Message
+from .._types import AgentResponse, AgentResponseUpdate, Message, ResponseStream
 from ._agent_utils import resolve_agent_id
-from ._const import WORKFLOW_RUN_KWARGS_KEY
+from ._const import GLOBAL_KWARGS_KEY, INTERNAL_SOURCE_ID, WORKFLOW_RUN_KWARGS_KEY
 from ._executor import Executor, handler
 from ._message_utils import normalize_messages_input
 from ._request_info_mixin import response_handler
@@ -22,11 +23,20 @@ from ._typing_utils import is_chat_agent
 from ._workflow_context import WorkflowContext
 
 if sys.version_info >= (3, 12):
-    from typing import override  # type: ignore # pragma: no cover
+    from typing import override  # pragma: no cover
 else:
-    from typing_extensions import override  # type: ignore # pragma: no cover
+    from typing_extensions import override  # pragma: no cover
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_runtime_tools(agent: SupportsAgentRun) -> bool:
+    """Return whether the agent run surface accepts a tools keyword."""
+    try:
+        parameters = inspect.signature(agent.run).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(parameter.name == "tools" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
 
 
 @dataclass
@@ -57,7 +67,63 @@ class AgentExecutorResponse:
 
     executor_id: str
     agent_response: AgentResponse
-    full_conversation: list[Message] | None = None
+    full_conversation: list[Message]
+
+    def with_text(self, text: str) -> "AgentExecutorResponse":
+        """Create a new AgentExecutorResponse with replaced text, preserving the conversation history.
+
+        Use this in custom executors that transform agent output text (e.g. upper-casing, summarising)
+        when you need downstream AgentExecutors to still have access to the full prior conversation.
+
+        Without this helper, sending a plain ``str`` from a custom executor breaks the context chain:
+        the downstream ``AgentExecutor.from_str`` handler only adds that one string to its cache and
+        loses all prior messages.  By using ``with_text`` the response type stays
+        ``AgentExecutorResponse``, so ``AgentExecutor.from_response`` is invoked instead and the full
+        conversation is preserved.
+
+        Args:
+            text: The replacement assistant message text.
+
+        Returns:
+            A new ``AgentExecutorResponse`` whose ``agent_response`` contains a single assistant
+            message with ``text``, and whose ``full_conversation`` is the prior conversation
+            (everything before the original agent turn) followed by the new assistant message.
+
+        Example:
+            .. code-block:: python
+
+                from agent_framework import AgentExecutorResponse, WorkflowContext, executor
+
+
+                @executor(
+                    id="upper_case_executor",
+                    input=AgentExecutorResponse,
+                    output=AgentExecutorResponse,
+                    workflow_output=str,
+                )
+                async def upper_case(
+                    response: AgentExecutorResponse,
+                    ctx: WorkflowContext[AgentExecutorResponse, str],
+                ) -> None:
+                    upper_text = response.agent_response.text.upper()
+                    await ctx.send_message(response.with_text(upper_text))
+                    await ctx.yield_output(upper_text)
+        """
+        new_message = Message("assistant", [text])
+        new_agent_response = AgentResponse(messages=[new_message])
+
+        # Strip off the original agent turn and replace with the new text.
+        n_agent_messages = len(self.agent_response.messages)
+        prior_messages = (
+            self.full_conversation[:-n_agent_messages] if n_agent_messages else list(self.full_conversation)
+        )
+        new_full_conversation = [*prior_messages, new_message]
+
+        return AgentExecutorResponse(
+            executor_id=self.executor_id,
+            agent_response=new_agent_response,
+            full_conversation=new_full_conversation,
+        )
 
 
 class AgentExecutor(Executor):
@@ -67,7 +133,7 @@ class AgentExecutor(Executor):
     - run(stream=True): Emits incremental output events (type='output') as the agent produces tokens
     - run(): Emits a single output event (type='output') containing the complete response
 
-    Use `with_output_from` in WorkflowBuilder to control whether the AgentResponse
+    Use `output_from` in WorkflowBuilder to control whether the AgentResponse
     or AgentResponseUpdate objects are yielded as workflow outputs.
 
     Messages sent to downstream executors will always be the complete AgentResponse. In
@@ -83,6 +149,8 @@ class AgentExecutor(Executor):
         *,
         session: AgentSession | None = None,
         id: str | None = None,
+        context_mode: Literal["full", "last_agent", "custom"] | None = None,
+        context_filter: Callable[[list[Message]], list[Message]] | None = None,
     ):
         """Initialize the executor with a unique identifier.
 
@@ -90,6 +158,17 @@ class AgentExecutor(Executor):
             agent: The agent to be wrapped by this executor.
             session: The session to use for running the agent. If None, a new session will be created.
             id: A unique identifier for the executor. If None, the agent's name will be used if available.
+            context_mode: Configuration for how the executor should manage conversation context upon
+                receiving an AgentExecutorResponse as input. Options:
+                - "full": append the full conversation (all prior messages + latest agent response) to the
+                   cache for the agent run. This is the default mode.
+                - "last_agent": provide only the messages from the latest agent response as context for
+                   the agent run.
+                - "custom": use the provided context_filter function to determine which messages to include
+                   as context for the agent run.
+            context_filter: A function that takes the full conversation (list of Messages) as input and returns
+                a filtered list of Messages to be used as context for the agent run. This is required
+                if context_mode is set to "custom".
         """
         # Prefer provided id; else use agent.name if present; else generate deterministic prefix
         exec_id = id or resolve_agent_id(agent)
@@ -97,6 +176,7 @@ class AgentExecutor(Executor):
             raise ValueError("Agent must have a non-empty name or id or an explicit id must be provided.")
         super().__init__(exec_id)
         self._agent = agent
+        self._accepts_runtime_tools = _accepts_runtime_tools(agent)
         self._session = session or self._agent.create_session()
 
         self._pending_agent_requests: dict[str, Content] = {}
@@ -106,6 +186,14 @@ class AgentExecutor(Executor):
         self._cache: list[Message] = []
         # This tracks the full conversation after each run
         self._full_conversation: list[Message] = []
+
+        # Context mode validation
+        self._context_mode = context_mode or "full"
+        self._context_filter = context_filter
+        if self._context_mode not in {"full", "last_agent", "custom"}:
+            raise ValueError("context_mode must be one of 'full', 'last_agent', or 'custom'.")
+        if self._context_mode == "custom" and not self._context_filter:
+            raise ValueError("context_filter must be provided when context_mode is set to 'custom'.")
 
     @property
     def agent(self) -> SupportsAgentRun:
@@ -129,6 +217,7 @@ class AgentExecutor(Executor):
         run the agent and emit an AgentExecutorResponse downstream.
         """
         self._cache.extend(request.messages)
+
         if request.should_respond:
             await self._run_agent_and_emit(ctx)
 
@@ -143,19 +232,45 @@ class AgentExecutor(Executor):
         Strategy: treat the prior response's messages as the conversation state and
         immediately run the agent to produce a new response.
         """
-        # Replace cache with full conversation if available, else fall back to agent_response messages.
-        source_messages = (
-            prior.full_conversation if prior.full_conversation is not None else prior.agent_response.messages
-        )
-        self._cache = list(source_messages)
+        if self._context_mode == "full":
+            self._cache.extend(prior.full_conversation)
+        elif self._context_mode == "last_agent":
+            self._cache.extend(prior.agent_response.messages)
+        else:
+            if not self._context_filter:
+                # This should never happen due to validation in __init__, but mypy doesn't track that well
+                raise ValueError("context_filter function must be provided for 'custom' context_mode.")
+            self._cache.extend(self._context_filter(prior.full_conversation))
+
         await self._run_agent_and_emit(ctx)
 
     @handler
     async def from_str(
         self, text: str, ctx: WorkflowContext[AgentExecutorResponse, AgentResponse | AgentResponseUpdate]
     ) -> None:
-        """Accept a raw user prompt string and run the agent (one-shot)."""
-        self._cache = normalize_messages_input(text)
+        """Accept a raw user prompt string and run the agent.
+
+        The new string input will be added to the cache which is used as the conversation context for the agent run.
+
+        Warning:
+            If the upstream executor received an ``AgentExecutorResponse`` but emits a plain
+            ``str``, this handler will be invoked instead of ``from_response``. This resets
+            the conversation context because only the new string is added to the cache and
+            all prior messages from the upstream agent are lost.
+
+            To preserve the full conversation when transforming agent output in a custom
+            executor, use ``AgentExecutorResponse.with_text(...)`` so that the message type
+            stays ``AgentExecutorResponse`` and ``from_response`` is called instead.
+        """
+        if not self._cache and ctx.source_executor_ids != [INTERNAL_SOURCE_ID(self.id)]:
+            logger.warning(
+                "AgentExecutor '%s': from_str handler invoked with an empty cache. "
+                "If you are chaining from an AgentExecutor, the upstream custom executor may be "
+                "emitting a plain str instead of using AgentExecutorResponse.with_text(...), "
+                "which causes the full conversation context to be lost.",
+                self.id,
+            )
+        self._cache.extend(normalize_messages_input(text))
         await self._run_agent_and_emit(ctx)
 
     @handler
@@ -164,8 +279,11 @@ class AgentExecutor(Executor):
         message: Message,
         ctx: WorkflowContext[AgentExecutorResponse, AgentResponse | AgentResponseUpdate],
     ) -> None:
-        """Accept a single Message as input."""
-        self._cache = normalize_messages_input(message)
+        """Accept a single Message as input.
+
+        The new message will be added to the cache which is used as the conversation context for the agent run.
+        """
+        self._cache.extend(normalize_messages_input(message))
         await self._run_agent_and_emit(ctx)
 
     @handler
@@ -174,8 +292,11 @@ class AgentExecutor(Executor):
         messages: list[str | Message],
         ctx: WorkflowContext[AgentExecutorResponse, AgentResponse | AgentResponseUpdate],
     ) -> None:
-        """Accept a list of chat inputs (strings or Message) as conversation context."""
-        self._cache = normalize_messages_input(messages)
+        """Accept a list of chat inputs (strings or Message) as conversation context.
+
+        The new messages will be added to the cache which is used as the conversation context for the agent run.
+        """
+        self._cache.extend(normalize_messages_input(messages))
         await self._run_agent_and_emit(ctx)
 
     @response_handler
@@ -198,13 +319,32 @@ class AgentExecutor(Executor):
         self._pending_agent_requests.pop(original_request.id, None)  # type: ignore[arg-type]
 
         if not self._pending_agent_requests:
-            # All pending requests have been resolved; resume agent execution.
-            # Use role="tool" for function_result responses (from declaration-only tools)
-            # so the LLM receives proper tool results instead of orphaned tool_calls.
-            role = "tool" if all(r.type == "function_result" for r in self._pending_responses_to_agent) else "user"
-            self._cache = normalize_messages_input(Message(role=role, contents=self._pending_responses_to_agent))
-            self._pending_responses_to_agent.clear()
-            await self._run_agent_and_emit(ctx)
+            await self._resume_with_pending_responses(ctx)
+
+    async def _resume_with_pending_responses(
+        self,
+        ctx: WorkflowContext[AgentExecutorResponse, AgentResponse | AgentResponseUpdate],
+    ) -> None:
+        """Resume agent execution after every pending request has reached an outcome."""
+        if not self._pending_responses_to_agent:
+            return
+        # Use role="tool" for function_result responses (from declaration-only tools)
+        # so the LLM receives proper tool results instead of orphaned tool_calls.
+        role = "tool" if all(r.type == "function_result" for r in self._pending_responses_to_agent) else "user"
+        self._cache = normalize_messages_input(Message(role=role, contents=self._pending_responses_to_agent))
+        self._pending_responses_to_agent.clear()
+        await self._run_agent_and_emit(ctx)
+
+    @override
+    async def _cancel_pending_request(
+        self,
+        request_id: str,
+        ctx: WorkflowContext[AgentExecutorResponse, AgentResponse | AgentResponseUpdate],
+    ) -> None:
+        """Release an agent-owned user-input request after workflow cancellation."""
+        self._pending_agent_requests.pop(request_id, None)
+        if not self._pending_agent_requests:
+            await self._resume_with_pending_responses(ctx)
 
     @override
     async def on_checkpoint_save(self) -> dict[str, Any]:
@@ -216,21 +356,6 @@ class AgentExecutor(Executor):
         Returns:
             Dict containing serialized cache and session state
         """
-        # Check if using AzureAIAgentClient with server-side session and warn about checkpointing limitations
-        if is_chat_agent(self._agent) and self._session.service_session_id is not None:
-            client_class_name = self._agent.client.__class__.__name__
-            client_module = self._agent.client.__class__.__module__
-
-            if client_class_name == "AzureAIAgentClient" and "azure_ai" in client_module:
-                logger.warning(
-                    "Checkpointing an AgentExecutor with AzureAIAgentClient that uses server-side sessions. "
-                    "Currently, checkpointing does not capture messages from server-side sessions "
-                    "(service_session_id: %s). The session state in checkpoints is not immutable and can be "
-                    "modified by subsequent runs. If you need reliable checkpointing with Azure AI agents, "
-                    "consider implementing a custom executor and managing the session state yourself.",
-                    self._session.service_session_id,
-                )
-
         serialized_session = self._session.to_dict()
 
         return {
@@ -249,24 +374,10 @@ class AgentExecutor(Executor):
             state: Checkpoint data dict
         """
         cache_payload = state.get("cache")
-        if cache_payload:
-            try:
-                self._cache = cache_payload
-            except Exception as exc:
-                logger.warning("Failed to restore cache: %s", exc)
-                self._cache = []
-        else:
-            self._cache = []
+        self._cache = cache_payload or []
 
         full_conversation_payload = state.get("full_conversation")
-        if full_conversation_payload:
-            try:
-                self._full_conversation = full_conversation_payload
-            except Exception as exc:
-                logger.warning("Failed to restore full conversation: %s", exc)
-                self._full_conversation = []
-        else:
-            self._full_conversation = []
+        self._full_conversation = full_conversation_payload or []
 
         session_payload = state.get("agent_session")
         if session_payload:
@@ -279,12 +390,10 @@ class AgentExecutor(Executor):
             self._session = self._agent.create_session()
 
         pending_requests_payload = state.get("pending_agent_requests")
-        if pending_requests_payload:
-            self._pending_agent_requests = pending_requests_payload
+        self._pending_agent_requests = pending_requests_payload or {}
 
         pending_responses_payload = state.get("pending_responses_to_agent")
-        if pending_responses_payload:
-            self._pending_responses_to_agent = pending_responses_payload
+        self._pending_responses_to_agent = pending_responses_payload or []
 
     def reset(self) -> None:
         """Reset the internal cache of the executor."""
@@ -331,24 +440,51 @@ class AgentExecutor(Executor):
         Returns:
             The complete AgentResponse, or None if waiting for user input.
         """
-        run_kwargs, options = self._prepare_agent_run_args(ctx.get_state(WORKFLOW_RUN_KWARGS_KEY, {}))
+        raw_run_kwargs = ctx.get_state(WORKFLOW_RUN_KWARGS_KEY, {})
+        function_invocation_kwargs, client_kwargs = self._prepare_agent_run_args(raw_run_kwargs)
+        tools = ctx.get_runtime_tools()
 
-        response = await self._agent.run(
-            self._cache,
-            stream=False,
-            session=self._session,
-            options=options,
-            **run_kwargs,
-        )
-        await ctx.yield_output(response)
+        if not self._cache:
+            logger.warning(
+                "AgentExecutor %s: Running agent with empty message cache. "
+                "This could lead to service error for some LLM providers.",
+                self.id,
+            )
+
+        run_agent = cast(Callable[..., Awaitable[AgentResponse[Any]]], self._agent.run)
+        run_kwargs: dict[str, Any] = {
+            "stream": False,
+            "session": self._session,
+            "function_invocation_kwargs": function_invocation_kwargs,
+            "client_kwargs": client_kwargs,
+        }
+        if tools is not None and self._accepts_runtime_tools:
+            run_kwargs["tools"] = tools
+        response = await run_agent(self._cache, **run_kwargs)
 
         # Handle any user input requests
         if response.user_input_requests:
+            user_input_request_count = len(response.user_input_requests)
+            total_message_content_count = sum(len(msg.contents) for msg in response.messages)
+            if user_input_request_count != total_message_content_count:
+                logger.warning(
+                    "Response %s contains %d user input requests but total message contents are %d. "
+                    "This indicates the response contains both user input requests and message contents. "
+                    "Double check if this is the intended behavior, as non user input request contents in "
+                    "this response will not be emitted.",
+                    response.response_id,
+                    user_input_request_count,
+                    total_message_content_count,
+                )
             for user_input_request in response.user_input_requests:
                 self._pending_agent_requests[user_input_request.id] = user_input_request  # type: ignore[index]
-                await ctx.request_info(user_input_request, Content)
+                await ctx.request_info(user_input_request, Content, request_id=user_input_request.id)
             return None
 
+        # Only yield output if the response is complete and not waiting for user input.
+        # This is to avoid emitting two events of different types ('output' and 'request_info')
+        # that carry the same payload.
+        await ctx.yield_output(response)
         return response
 
     async def _run_agent_streaming(self, ctx: WorkflowContext[Never, AgentResponseUpdate]) -> AgentResponse | None:
@@ -360,26 +496,54 @@ class AgentExecutor(Executor):
         Returns:
             The complete AgentResponse, or None if waiting for user input.
         """
-        run_kwargs, options = self._prepare_agent_run_args(ctx.get_state(WORKFLOW_RUN_KWARGS_KEY, {}))
+        raw_run_kwargs = ctx.get_state(WORKFLOW_RUN_KWARGS_KEY, {})
+        function_invocation_kwargs, client_kwargs = self._prepare_agent_run_args(raw_run_kwargs)
+        tools = ctx.get_runtime_tools()
+
+        if not self._cache:
+            logger.warning(
+                "AgentExecutor %s: Running agent with empty message cache. "
+                "This could lead to service error for some LLM providers.",
+                self.id,
+            )
 
         updates: list[AgentResponseUpdate] = []
         streamed_user_input_requests: list[Content] = []
-        stream = self._agent.run(
-            self._cache,
-            stream=True,
-            session=self._session,
-            options=options,
-            **run_kwargs,
-        )
+        run_agent_stream = cast(Callable[..., ResponseStream[AgentResponseUpdate, AgentResponse[Any]]], self._agent.run)
+        run_kwargs: dict[str, Any] = {
+            "stream": True,
+            "session": self._session,
+            "function_invocation_kwargs": function_invocation_kwargs,
+            "client_kwargs": client_kwargs,
+        }
+        if tools is not None and self._accepts_runtime_tools:
+            run_kwargs["tools"] = tools
+        stream = run_agent_stream(self._cache, **run_kwargs)
         async for update in stream:
             updates.append(update)
-            await ctx.yield_output(update)
             if update.user_input_requests:
+                user_input_request_count = len(update.user_input_requests)
+                total_message_content_count = len(update.contents)
+                if user_input_request_count != total_message_content_count:
+                    logger.warning(
+                        "Response update %s contains %d user input requests but total message contents are %d. "
+                        "This indicates the response update contains both user input requests and message contents. "
+                        "Double check if this is the intended behavior, as non user input request contents will "
+                        "not be emitted.",
+                        update.response_id,
+                        user_input_request_count,
+                        total_message_content_count,
+                    )
                 streamed_user_input_requests.extend(update.user_input_requests)
+            else:
+                # Only yield output events for updates that do not contain user input requests.
+                # This is to avoid emitting two events of different types ('output' and 'request_info')
+                # that carry the same payload.
+                await ctx.yield_output(update)
 
         # Prefer stream finalization when available so result hooks run
         # (e.g., thread conversation updates). Fall back to reconstructing from updates
-        # for legacy/custom agents that return a plain async iterable.
+        # for compatibility/custom agents that return a plain async iterable.
         # TODO(evmattso): Integrate workflow agent run handling around ResponseStream so
         # AgentExecutor does not need this conditional stream-finalization branch.
         maybe_get_final_response = getattr(stream, "get_final_response", None)
@@ -410,79 +574,66 @@ class AgentExecutor(Executor):
         if user_input_requests:
             for user_input_request in user_input_requests:
                 self._pending_agent_requests[user_input_request.id] = user_input_request  # type: ignore[index]
-                await ctx.request_info(user_input_request, Content)
+                await ctx.request_info(user_input_request, Content, request_id=user_input_request.id)
             return None
 
         return response
 
-    # Parameters that are explicitly passed to agent.run() by AgentExecutor
-    # and must not appear in **run_kwargs to avoid TypeError from duplicate values.
-    _RESERVED_RUN_PARAMS: frozenset[str] = frozenset({"session", "stream", "messages"})
+    def _prepare_agent_run_args(
+        self,
+        raw_run_kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Prepare function_invocation_kwargs and client_kwargs for agent.run().
 
-    @staticmethod
-    def _prepare_agent_run_args(raw_run_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        """Prepare kwargs and options for agent.run(), avoiding duplicate option passing.
+        Extracts ``function_invocation_kwargs`` and ``client_kwargs`` from the
+        workflow state dict, resolving per-executor entries using ``self.id``. The
+        ``__global__`` sentinel key (set by ``Workflow._resolve_invocation_kwargs``) denotes
+        global kwargs that apply to all executors. Per-executor dicts use executor IDs as
+        keys; this executor extracts only its own entry.
 
-        Workflow-level kwargs are propagated to tool calls through
-        `options.additional_function_arguments`. If workflow kwargs include an
-        `options` key, merge it into the final options object and remove it from
-        kwargs before spreading `**run_kwargs`.
-
-        Reserved parameters (session, stream, messages) that are explicitly
-        managed by AgentExecutor are stripped from run_kwargs to prevent
-        ``TypeError: got multiple values for keyword argument`` collisions.
+        Returns:
+            A 2-tuple of (function_invocation_kwargs, client_kwargs).
         """
-        run_kwargs = dict(raw_run_kwargs)
+        fi_resolved = raw_run_kwargs.get("function_invocation_kwargs")
+        ci_resolved = raw_run_kwargs.get("client_kwargs")
+        function_invocation_kwargs = self._resolve_executor_kwargs(fi_resolved)
+        client_kwargs = self._resolve_executor_kwargs(ci_resolved)
 
-        # Strip reserved params that AgentExecutor passes explicitly to agent.run().
-        for key in AgentExecutor._RESERVED_RUN_PARAMS:
-            if key in run_kwargs:
-                logger.warning(
-                    "Workflow kwarg '%s' is reserved by AgentExecutor and will be ignored. "
-                    "Remove it from workflow.run() kwargs to silence this warning.",
-                    key,
-                )
-                run_kwargs.pop(key)
+        return function_invocation_kwargs, client_kwargs
 
-        options_from_workflow = run_kwargs.pop("options", None)
-        workflow_additional_args = run_kwargs.pop("additional_function_arguments", None)
+    def _resolve_executor_kwargs(self, resolved: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Extract this executor's kwargs from a resolved invocation kwargs dict.
 
-        options: dict[str, Any] = {}
-        if options_from_workflow is not None:
-            if isinstance(options_from_workflow, Mapping):
-                options_from_workflow_map = cast(Mapping[str, Any], options_from_workflow)
-                for key, value in options_from_workflow_map.items():
-                    options[key] = value
-            else:
-                logger.warning(
-                    "Ignoring non-mapping workflow 'options' kwarg of type %s for AgentExecutor %s.",
-                    type(options_from_workflow).__name__,
-                    AgentExecutor.__name__,
-                )
+        Args:
+            resolved: The resolved dict produced by ``Workflow._resolve_invocation_kwargs``,
+                containing either a ``__global__`` key (global kwargs) or executor-ID keys
+                (per-executor kwargs). May also be ``None``.
 
-        existing_additional_args = options.get("additional_function_arguments")
-        additional_args: dict[str, Any]
-        if isinstance(existing_additional_args, Mapping):
-            existing_additional_args_map = cast(Mapping[str, Any], existing_additional_args)
-            additional_args = {key: value for key, value in existing_additional_args_map.items()}
-        else:
-            additional_args = {}
+        Returns:
+            The kwargs for this executor, or ``None`` if not applicable.
+        """
+        if not isinstance(resolved, dict):
+            return None
+        global_kwargs: Any = resolved.get(GLOBAL_KWARGS_KEY)
+        executor_kwargs: Any = resolved.get(self.id)
+        if global_kwargs is None and executor_kwargs is None:
+            return None
 
-        if workflow_additional_args is not None:
-            if isinstance(workflow_additional_args, Mapping):
-                workflow_additional_args_map = cast(Mapping[str, Any], workflow_additional_args)
-                additional_args.update({key: value for key, value in workflow_additional_args_map.items()})
-            else:
-                logger.warning(
-                    "Ignoring non-mapping workflow 'additional_function_arguments' kwarg of type %s for AgentExecutor %s.",  # noqa: E501
-                    type(workflow_additional_args).__name__,
-                    AgentExecutor.__name__,
-                )
+        if global_kwargs is not None and not isinstance(global_kwargs, dict):
+            logger.warning(
+                "Executor %s expected a dict for global kwargs, but got %s. Ignoring.",
+                self.id,
+                cast(type[Any], type(global_kwargs)),
+            )
+            return None
 
-        if run_kwargs:
-            additional_args.update(run_kwargs)
+        if executor_kwargs is not None and not isinstance(executor_kwargs, dict):
+            logger.warning(
+                "Executor %s expected a dict for its kwargs, but got %s. Ignoring.",
+                self.id,
+                cast(type[Any], type(executor_kwargs)),
+            )
+            return None
 
-        if additional_args:
-            options["additional_function_arguments"] = additional_args
-
-        return run_kwargs, options or None
+        # Specific values override global values for the same function argument.
+        return {**(global_kwargs or {}), **(executor_kwargs or {})}

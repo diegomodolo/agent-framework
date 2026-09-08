@@ -15,6 +15,10 @@ Interactive developer UI for testing and debugging agents and workflows.
 - **`OpenAIResponse`** / **`OpenAIError`** - OpenAI-compatible response models
 - **`DiscoveryResponse`** / **`EntityInfo`** - Entity discovery models
 
+Text content carrying `additional_properties["model_output_kind"] == "refusal"` is mapped to native
+Responses refusal parts and events. Mapper aggregation, live rendering, and recovery state retain
+text/refusal boundaries by item and content index.
+
 ## Usage
 
 ```python
@@ -33,6 +37,12 @@ devui ./agents
 # Run with specific entities
 devui --entities my_agent.py
 ```
+
+## Security Posture
+
+DevUI is a development-only sample app, not a production hosting surface. Authentication is enabled by default.
+Unauthenticated mode is allowed only on `localhost` / `127.0.0.1`; `0.0.0.0`, LAN IPs, and hostnames require
+`DEVUI_AUTH_TOKEN` or `--auth-token`.
 
 ## Import Path
 
